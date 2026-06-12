@@ -29,7 +29,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_VERSION = "V14.5 - Filtros seguros + HC por periodo + Provisión streaming + Predicción financiera"
+APP_VERSION = "V14.6 - Descargas seguras + Excel ejecutivo liviano + HC por periodo"
 ORANGE = "#F26A21"
 BLUE = "#005AA9"
 GREEN = "#2E8B57"
@@ -1447,6 +1447,54 @@ def make_excel(report: Dict[str, pd.DataFrame], extras: Dict[str, pd.DataFrame])
             ws.freeze_panes(1, 0)
     return output.getvalue()
 
+
+
+def safe_download_button(label: str, data: bytes, file_name: str, mime: str, key: str = None):
+    """Botón de descarga que no dispara rerun. Evita que Streamlit reprocesa y tumbe la app al descargar."""
+    try:
+        return st.download_button(
+            label,
+            data=data,
+            file_name=file_name,
+            mime=mime,
+            width="stretch",
+            key=key,
+            on_click="ignore",
+        )
+    except TypeError:
+        return st.download_button(
+            label,
+            data=data,
+            file_name=file_name,
+            mime=mime,
+            width="stretch",
+            key=key,
+        )
+
+
+def make_excel_ejecutivo(report: Dict[str, pd.DataFrame], extras: Dict[str, pd.DataFrame]) -> bytes:
+    """Excel liviano para presentación. No incluye raw ni maestro gigante.
+
+    El detalle completo queda dentro del paquete homologado ZIP. Esto evita caídas
+    por memoria al generar/descargar Excel en Streamlit Cloud.
+    """
+    keep_report = [
+        "Resumen_Ejecutivo_Sin_Ceros",
+        "Resumen_Ejecutivo",
+        "Resumen_Mes",
+        "Resumen_Cargo_Homologado",
+        "Indicadores_HC",
+    ]
+    keep_extras = [
+        "Alertas",
+        "Pendientes_Homologacion",
+        "Homologacion_Detalle_Horas",
+        "Headcount_Excluido",
+    ]
+    light_report = {k: report.get(k, pd.DataFrame()) for k in keep_report if k in report}
+    light_extras = {k: extras.get(k, pd.DataFrame()) for k in keep_extras if k in extras}
+    return make_excel(light_report, light_extras)
+
 # ==============================
 # Procesamiento orquestador
 # ==============================
@@ -2211,6 +2259,8 @@ def get_active_result() -> Optional[Dict[str, Any]]:
 def set_active_result(res: Dict[str, Any]) -> None:
     st.session_state["resultado_v12"] = res
     st.session_state["prediccion_v12"] = None
+    st.session_state["excel_ejecutivo_bytes"] = None
+    st.session_state["pred_excel_bytes"] = None
 
 
 # ==============================
@@ -2220,8 +2270,16 @@ if "resultado_v12" not in st.session_state:
     st.session_state["resultado_v12"] = None
 if "prediccion_v12" not in st.session_state:
     st.session_state["prediccion_v12"] = None
+    st.session_state["excel_ejecutivo_bytes"] = None
+    st.session_state["pred_excel_bytes"] = None
 if "paquete_v12_bytes" not in st.session_state:
     st.session_state["paquete_v12_bytes"] = None
+if "paquete_cargado_bytes" not in st.session_state:
+    st.session_state["paquete_cargado_bytes"] = None
+if "excel_ejecutivo_bytes" not in st.session_state:
+    st.session_state["excel_ejecutivo_bytes"] = None
+if "pred_excel_bytes" not in st.session_state:
+    st.session_state["pred_excel_bytes"] = None
 
 with st.sidebar:
     st.markdown("<div style='font-size:54px; line-height:1;'>🦜</div>", unsafe_allow_html=True)
@@ -2281,12 +2339,12 @@ if page == "1. Preparar paquete homologado":
             except Exception as e:
                 st.exception(e)
     if st.session_state.get("paquete_v12_bytes"):
-        st.download_button(
+        safe_download_button(
             "⬇️ Descargar paquete_homologado_v14.zip",
             data=st.session_state["paquete_v12_bytes"],
             file_name=f"paquete_homologado_horas_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
             mime="application/zip",
-            width="stretch",
+            key="download_pkg_preparado",
         )
     if get_active_result():
         m = get_active_result().get("metrics", {})
@@ -2305,6 +2363,7 @@ elif page == "2. Cargar paquete y comparar":
         if st.button("📦 Cargar paquete homologado", type="primary"):
             try:
                 res = load_homologated_package(paquete)
+                st.session_state["paquete_cargado_bytes"] = paquete.getvalue()
                 set_active_result(res)
                 st.success("Paquete cargado. Ya puedes filtrar y descargar resultados sin reprocesar los Excel originales.")
             except Exception as e:
@@ -2370,10 +2429,32 @@ elif page == "2. Cargar paquete y comparar":
             with tab3:
                 display_df(report.get("Indicadores_HC", pd.DataFrame()))
             with tab4:
-                excel_bytes = make_excel(report, res.get("extras", {}))
-                st.download_button("⬇️ Descargar Excel comparativo", excel_bytes, "comparativo_horas_homologado.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
-                if st.session_state.get("paquete_v12_bytes"):
-                    st.download_button("⬇️ Descargar paquete homologado", st.session_state["paquete_v12_bytes"], "paquete_homologado_v14.zip", mime="application/zip", width="stretch")
+                st.info("Para evitar caídas por memoria, el Excel descargable es ejecutivo/liviano. El detalle completo queda en el paquete homologado ZIP.")
+                if st.button("📄 Generar Excel ejecutivo", key="btn_generar_excel_ejecutivo"):
+                    with st.spinner("Generando Excel ejecutivo liviano..."):
+                        try:
+                            st.session_state["excel_ejecutivo_bytes"] = make_excel_ejecutivo(report, res.get("extras", {}))
+                            st.success("Excel ejecutivo generado. Ya puedes descargarlo.")
+                        except Exception as e:
+                            st.error("No fue posible generar el Excel ejecutivo.")
+                            st.caption(f"Detalle técnico: {type(e).__name__}: {e}")
+                if st.session_state.get("excel_ejecutivo_bytes"):
+                    safe_download_button(
+                        "⬇️ Descargar Excel ejecutivo",
+                        st.session_state["excel_ejecutivo_bytes"],
+                        "comparativo_horas_resumen_ejecutivo.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_excel_ejecutivo",
+                    )
+                pkg_bytes = st.session_state.get("paquete_v12_bytes") or st.session_state.get("paquete_cargado_bytes")
+                if pkg_bytes:
+                    safe_download_button(
+                        "⬇️ Descargar paquete homologado completo",
+                        pkg_bytes,
+                        "paquete_homologado_v14.zip",
+                        "application/zip",
+                        key="download_pkg_modulo2",
+                    )
 
 elif page == "3. Predicción financiera":
     st.subheader("3. Predicción financiera del mes en curso")
@@ -2416,6 +2497,7 @@ elif page == "3. Predicción financiera":
                     calendario={"dias_mes": dias_mes, "domingos": domingos, "festivos": festivos},
                 )
                 st.session_state["prediccion_v12"] = pred
+                st.session_state["pred_excel_bytes"] = None
                 st.success("Predicción generada.")
             except Exception as e:
                 st.exception(e)
@@ -2434,8 +2516,22 @@ elif page == "3. Predicción financiera":
             with tabs[2]: display_df(pred.get("Prediccion_Area_Cargo", pd.DataFrame()))
             with tabs[3]: display_df(pred.get("Alertas_Prediccion", pd.DataFrame()))
             with tabs[4]:
-                pred_excel = make_prediction_excel(pred)
-                st.download_button("⬇️ Descargar Excel predicción", pred_excel, "prediccion_financiera_horas.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
+                if st.button("📄 Generar Excel predicción", key="btn_generar_excel_pred"):
+                    with st.spinner("Generando Excel de predicción..."):
+                        try:
+                            st.session_state["pred_excel_bytes"] = make_prediction_excel(pred)
+                            st.success("Excel de predicción generado. Ya puedes descargarlo.")
+                        except Exception as e:
+                            st.error("No fue posible generar el Excel de predicción.")
+                            st.caption(f"Detalle técnico: {type(e).__name__}: {e}")
+                if st.session_state.get("pred_excel_bytes"):
+                    safe_download_button(
+                        "⬇️ Descargar Excel predicción",
+                        st.session_state["pred_excel_bytes"],
+                        "prediccion_financiera_horas.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_excel_pred",
+                    )
 
 elif page == "4. Diagnóstico y alertas":
     st.subheader("4. Diagnóstico y alertas")
