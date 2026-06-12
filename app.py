@@ -602,6 +602,36 @@ def standard_alert_df(alerts: List[str]) -> pd.DataFrame:
             rows.append({"tipo": "Validación", "alerta": str(a)})
     return pd.DataFrame(rows)
 
+
+def money_fmt(v) -> str:
+    try:
+        return ("${:,.0f}".format(float(v))).replace(",", ".")
+    except Exception:
+        return "$0"
+
+
+def qty_fmt(v) -> str:
+    try:
+        s = "{:,.2f}".format(float(v))
+        return s.replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return "0,00"
+
+
+def dataframe_config(df: pd.DataFrame) -> Dict:
+    cfg = {}
+    if df is None or df.empty:
+        return cfg
+    for c in df.columns:
+        cl = norm_text(c)
+        if any(x in cl for x in ["VALOR", "IMPORTE", "PROVISION", "PROYECCION", "PAGADO", "DIF", "COSTO", "SALARIO"]):
+            cfg[c] = st.column_config.NumberColumn(c, format="$ %d")
+        elif any(x in cl for x in ["CANTIDAD", "CANT", "HORAS", "Q"]):
+            cfg[c] = st.column_config.NumberColumn(c, format="%.2f")
+        elif "PCT" in cl or "DESV" in cl or "PORC" in cl:
+            cfg[c] = st.column_config.NumberColumn(c, format="%.2f")
+    return cfg
+
 # =============================================================
 # LECTURA / NORMALIZACIÓN DE INSUMOS
 # =============================================================
@@ -761,10 +791,27 @@ def process_provision(files, hom) -> Tuple[pd.DataFrame, List[str]]:
     return (pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()), alerts
 
 
-def process_proyeccion(files, hom) -> Tuple[pd.DataFrame, List[str]]:
+def process_proyeccion(files, hom, md_periodo=None) -> Tuple[pd.DataFrame, List[str]]:
+    """Procesa la proyección.
+
+    Reglas de homologación de cargo:
+    1) Si la proyección trae SAP válido y existe ese SAP en el Headcount/MD del mismo periodo,
+       toma la función/cargo/CECO/área de ese periodo.
+    2) Si SAP viene Error, vacío o no cruza, toma la columna Función/Cargo propia de la proyección.
+    3) Si tampoco homologa, deja alerta para revisión.
+    """
     alerts, rows = [], []
     if not files:
         return pd.DataFrame(), ["No se cargó proyección."]
+
+    md_lookup = pd.DataFrame()
+    if md_periodo is not None and not md_periodo.empty:
+        cols = [c for c in ["periodo_novedad", "sap", "funcion", "cargo_original", "cargo_homologado", "area_negocio", "ceco", "area_nomina"] if c in md_periodo.columns]
+        md_lookup = md_periodo[cols].copy()
+        if "sap" in md_lookup.columns:
+            md_lookup["sap"] = md_lookup["sap"].map(clean_code)
+        md_lookup = md_lookup.drop_duplicates(["periodo_novedad", "sap"], keep="last") if {"periodo_novedad", "sap"}.issubset(md_lookup.columns) else pd.DataFrame()
+
     for f in files:
         name = uploaded_name(f)
         try:
@@ -772,6 +819,7 @@ def process_proyeccion(files, hom) -> Tuple[pd.DataFrame, List[str]]:
             df = read_table(f, sheet_name=sh)
             df.columns = [str(c).strip() for c in df.columns]
             col_period = find_col(df, ["MES", "Periodo", "Source.Name"], required=True)
+            col_sap = find_col(df, ["SAP", "Nº pers.", "N° pers.", "Número de personal"], required=False)
             col_ceco = find_col(df, ["Ce.coste", "CECO"], required=False)
             col_cargo = find_col(df, ["Funcion", "Función", "Cargo"], required=False)
             col_tipo = find_col(df, ["Tipo"], required=False)
@@ -779,11 +827,48 @@ def process_proyeccion(files, hom) -> Tuple[pd.DataFrame, List[str]]:
             base = pd.DataFrame({
                 "source_file": name,
                 "periodo_novedad": fill_period_series(df[col_period].map(lambda x: period_from_any(x, name)), period_from_any(None, name)),
-                "ceco": df[col_ceco].map(clean_ceco) if col_ceco else "",
-                "cargo_original": df[col_cargo].astype(str) if col_cargo else "",
+                "sap": df[col_sap].map(clean_code) if col_sap else "",
+                "ceco_origen": df[col_ceco].map(clean_ceco) if col_ceco else "",
+                "cargo_original_base": df[col_cargo].astype(str) if col_cargo else "",
                 "tipo_origen": df[col_tipo].astype(str) if col_tipo else "",
-                "area_nomina": df[col_area_nom].astype(str) if col_area_nom else "",
+                "area_nomina_origen": df[col_area_nom].astype(str) if col_area_nom else "",
             })
+            # SAP inválido: Error, vacío, nan o no numérico. En esos casos NO se fuerza cruce por SAP.
+            base["sap_valido"] = base["sap"].astype(str).str.fullmatch(r"\d+").fillna(False)
+
+            if not md_lookup.empty:
+                base = base.merge(md_lookup, on=["periodo_novedad", "sap"], how="left", suffixes=("", "_md"))
+                base["tiene_md_periodo"] = base["cargo_homologado"].notna() & base["sap_valido"]
+            else:
+                base["funcion"] = ""
+                base["cargo_original"] = ""
+                base["cargo_homologado"] = np.nan
+                base["area_negocio"] = np.nan
+                base["ceco"] = np.nan
+                base["area_nomina"] = np.nan
+                base["tiene_md_periodo"] = False
+
+            # Fallback cuando SAP es Error/vacío/no cruza: usar Función/Cargo de la proyección.
+            base["cargo_para_homologar"] = np.where(base["tiene_md_periodo"], base.get("cargo_original", ""), base["cargo_original_base"])
+            base["funcion_para_homologar"] = np.where(base["tiene_md_periodo"], base.get("funcion", ""), "")
+            fallback_hom = [homologar_cargo(fun, car, hom) for fun, car in zip(base["funcion_para_homologar"], base["cargo_para_homologar"])]
+            base["cargo_homologado_calc"] = [x[0] for x in fallback_hom]
+            base["cargo_homologado_ok_calc"] = [x[1] for x in fallback_hom]
+            base["cargo_homologado_final"] = np.where(base["tiene_md_periodo"], base["cargo_homologado"], base["cargo_homologado_calc"])
+            base["cargo_homologado_ok_final"] = np.where(base["tiene_md_periodo"], True, base["cargo_homologado_ok_calc"])
+            base["ceco_final"] = np.where(base["tiene_md_periodo"], base["ceco"].fillna(""), base["ceco_origen"])
+            base["area_nomina_final"] = np.where(base["tiene_md_periodo"], base.get("area_nomina", "").fillna(""), base["area_nomina_origen"])
+            base["area_negocio_final"] = np.where(
+                base["tiene_md_periodo"],
+                base["area_negocio"].fillna("Sin clasificar"),
+                [classify_area(c, t, None, a, None) for c, t, a in zip(base["ceco_origen"], base["tipo_origen"], base["area_nomina_origen"])]
+            )
+            base["metodo_homologacion"] = np.where(
+                base["tiene_md_periodo"],
+                "SAP + Headcount/MD del periodo",
+                np.where(base["sap_valido"], "Función/Cargo proyección (SAP no cruzó)", "Función/Cargo proyección (SAP inválido/Error)")
+            )
+
             for concepto in CONCEPTOS:
                 q_col = f"{concepto}_Q"
                 v_col = f"{concepto}_$"
@@ -797,20 +882,34 @@ def process_proyeccion(files, hom) -> Tuple[pd.DataFrame, List[str]]:
                 tmp = tmp[(tmp["cantidad_proyectada"].abs() > 0) | (tmp["valor_proyectado"].abs() > 0)].copy()
                 if tmp.empty:
                     continue
-                homol = [homologar_cargo(None, car, hom) for car in tmp["cargo_original"]]
-                tmp["cargo_homologado"] = [x[0] for x in homol]
-                tmp["cargo_homologado_ok"] = [x[1] for x in homol]
-                tmp["area_negocio"] = [classify_area(c, t, None, a, None) for c, t, a in zip(tmp["ceco"], tmp["tipo_origen"], tmp["area_nomina"])]
-                rows.append(tmp)
+                out = pd.DataFrame()
+                out["source_file"] = tmp["source_file"]
+                out["periodo_novedad"] = tmp["periodo_novedad"]
+                out["sap"] = tmp["sap"]
+                out["concepto"] = tmp["concepto"]
+                out["tipo_hora"] = tmp["tipo_hora"]
+                out["cantidad_proyectada"] = tmp["cantidad_proyectada"]
+                out["valor_proyectado"] = tmp["valor_proyectado"]
+                out["ceco"] = tmp["ceco_final"].map(clean_ceco)
+                out["cargo_original"] = tmp["cargo_para_homologar"].astype(str)
+                out["cargo_homologado"] = tmp["cargo_homologado_final"].astype(str)
+                out["cargo_homologado_ok"] = tmp["cargo_homologado_ok_final"].astype(bool)
+                out["area_negocio"] = tmp["area_negocio_final"].astype(str)
+                out["metodo_homologacion"] = tmp["metodo_homologacion"].astype(str)
+                rows.append(out)
+
+            sap_error = int((~base["sap_valido"]).sum()) if col_sap else 0
+            if sap_error:
+                alerts.append(f"{name}: {sap_error:,.0f} registros de proyección tenían SAP inválido/Error; se homologaron por Función/Cargo de la proyección.")
         except Exception as e:
             alerts.append(f"Error procesando proyección {name}: {e}")
     return (pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()), alerts
 
 
-def process_headcount(files, hom) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+def process_headcount(files, hom) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str]]:
     alerts, rows, excl = [], [], []
     if not files:
-        return pd.DataFrame(), pd.DataFrame(), ["No se cargó Headcount."]
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), ["No se cargó Headcount."]
     for f in files:
         name = uploaded_name(f)
         try:
@@ -854,13 +953,13 @@ def process_headcount(files, hom) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]
         except Exception as e:
             alerts.append(f"Error procesando Headcount {name}: {e}")
     if not rows:
-        return pd.DataFrame(), pd.DataFrame(), alerts
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), alerts
     detail = pd.concat(rows, ignore_index=True)
     hc = detail.groupby(KEY_HC, dropna=False).agg(hc=("sap", "nunique")).reset_index()
     excl_df = pd.concat(excl, ignore_index=True) if excl else pd.DataFrame()
     if not excl_df.empty:
         alerts.append(f"Headcount: se excluyeron {len(excl_df):,.0f} registros Manager I-IV/no aplican horas.")
-    return hc, excl_df, alerts
+    return hc, excl_df, detail, alerts
 
 
 def aggregate_sources(pagado, provision, proyeccion, hc) -> pd.DataFrame:
@@ -1571,7 +1670,7 @@ with st.sidebar:
     st.header("Menú")
     menu = st.radio(
         "Selecciona módulo",
-        ["1. Cargue y procesamiento", "2. Comparativo histórico", "3. Predicción mes en curso", "4. Plantillas"],
+        ["1. Cargue y procesamiento", "2. Comparativo histórico", "3. Predicción mes en curso", "4. Instructivo", "5. Plantillas"],
         index=0,
     )
 
@@ -1604,11 +1703,11 @@ if menu == "1. Cargue y procesamiento":
         progress.progress(45, text="Procesando provisión...")
         provision_df, alerts = process_provision(prov_files, hom)
         all_alerts += alerts
-        progress.progress(60, text="Procesando proyección...")
-        proyeccion_df, alerts = process_proyeccion(proy_files, hom)
+        progress.progress(60, text="Procesando Headcount y maestro de cargos por periodo...")
+        hc_df, excl_hc, hc_detail, alerts = process_headcount(hc_files, hom)
         all_alerts += alerts
-        progress.progress(75, text="Procesando Headcount...")
-        hc_df, excl_hc, alerts = process_headcount(hc_files, hom)
+        progress.progress(75, text="Procesando proyección con homologación por SAP/periodo o Función...")
+        proyeccion_df, alerts = process_proyeccion(proy_files, hom, hc_detail)
         all_alerts += alerts
         progress.progress(90, text="Construyendo comparativo...")
         comparativo = aggregate_sources(pagado_df, provision_df, proyeccion_df, hc_df)
@@ -1621,6 +1720,7 @@ if menu == "1. Cargue y procesamiento":
         st.session_state.provision_df = provision_df
         st.session_state.proyeccion_df = proyeccion_df
         st.session_state.hc_df = hc_df
+        st.session_state.hc_detail = hc_detail
         st.session_state.excl_hc = excl_hc
         st.session_state.comparativo = comparativo
         st.session_state.alertas = alertas_df
@@ -1687,18 +1787,18 @@ elif menu == "2. Comparativo histórico":
         threshold = st.session_state.get("threshold_comparativo", 0.15)
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Valor pagado", f"${filt['valor_pagado'].sum():,.0f}")
-    k2.metric("Valor provisión", f"${filt['valor_provisionado'].sum():,.0f}")
-    k3.metric("Valor proyección", f"${filt['valor_proyectado'].sum():,.0f}")
-    k4.metric("Dif. pagado vs provisión", f"${filt['dif_valor_pagado_vs_provision'].sum():,.0f}")
+    k1.metric("Valor pagado", money_fmt(filt['valor_pagado'].sum()))
+    k2.metric("Valor provisión", money_fmt(filt['valor_provisionado'].sum()))
+    k3.metric("Valor proyección", money_fmt(filt['valor_proyectado'].sum()))
+    k4.metric("Dif. pagado vs provisión", money_fmt(filt['dif_valor_pagado_vs_provision'].sum()))
 
     resumenes = st.session_state.get("resumenes_comparativo", resumenes_comparativo(filt))
     tab1, tab2, tab3, tab4 = st.tabs(["Resumen", "Gráficas", "Detalle", "Alertas / Descargar"])
     with tab1:
         st.markdown("#### Resumen por mes")
-        st.dataframe(resumenes.get("Resumen_mes", pd.DataFrame()), use_container_width=True)
+        st.dataframe(resumenes.get("Resumen_mes", pd.DataFrame()), use_container_width=True, column_config=dataframe_config(resumenes.get("Resumen_mes", pd.DataFrame())))
         st.markdown("#### Resumen por concepto")
-        st.dataframe(resumenes.get("Resumen_concepto", pd.DataFrame()), use_container_width=True)
+        st.dataframe(resumenes.get("Resumen_concepto", pd.DataFrame()), use_container_width=True, column_config=dataframe_config(resumenes.get("Resumen_concepto", pd.DataFrame())))
     with tab2:
         rm = resumenes.get("Resumen_mes", pd.DataFrame())
         if not rm.empty:
@@ -1712,7 +1812,7 @@ elif menu == "2. Comparativo histórico":
             fig2 = px.bar(top, x="dif", y="cargo_homologado", orientation="h", title="Top cargos por desviación pagado vs provisión")
             st.plotly_chart(fig2, use_container_width=True)
     with tab3:
-        st.dataframe(filt, use_container_width=True, height=520)
+        st.dataframe(filt, use_container_width=True, height=520, column_config=dataframe_config(filt))
     with tab4:
         alertas = st.session_state.get("alertas_comparativo_filtrado", build_alertas_comparativo(filt, [], threshold))
         st.dataframe(alertas, use_container_width=True)
@@ -1813,18 +1913,18 @@ elif menu == "3. Predicción mes en curso":
         ap = st.session_state.alertas_pred
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Cantidad estimada", f"{pred['cantidad_estimada'].sum():,.2f}")
-        k2.metric("Valor estimado", f"${pred['valor_estimado'].sum():,.0f}")
+        k2.metric("Valor estimado", money_fmt(pred['valor_estimado'].sum()))
         k3.metric("Pago estimado", shift_period(mes_pred, 1))
         k4.metric("Filas sin cuenta", f"{pred['cuenta'].eq('Sin cuenta').sum():,.0f}")
         tab1, tab2, tab3, tab4 = st.tabs(["Resumen", "Por cuentas", "Detalle", "Alertas / Descargar"])
         with tab1:
-            st.dataframe(rpred, use_container_width=True)
+            st.dataframe(rpred, use_container_width=True, column_config=dataframe_config(rpred))
             fig = px.bar(rpred.groupby(["concepto", "tipo_hora"], dropna=False).agg(valor_estimado=("valor_estimado", "sum")).reset_index(), x="concepto", y="valor_estimado", color="tipo_hora", title="Valor estimado por concepto")
             st.plotly_chart(fig, use_container_width=True)
         with tab2:
-            st.dataframe(rc, use_container_width=True)
+            st.dataframe(rc, use_container_width=True, column_config=dataframe_config(rc))
         with tab3:
-            st.dataframe(pred, use_container_width=True, height=520)
+            st.dataframe(pred, use_container_width=True, height=520, column_config=dataframe_config(pred))
         with tab4:
             st.dataframe(ap, use_container_width=True)
             sheets = {
@@ -1840,7 +1940,26 @@ elif menu == "3. Predicción mes en curso":
             xbytes = to_excel_bytes(sheets, include_chart=False)
             st.download_button("⬇️ Descargar Excel predicción", data=xbytes, file_name=f"prediccion_horas_{mes_pred.replace('.', '')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-elif menu == "4. Plantillas":
+elif menu == "4. Instructivo":
+    st.subheader("4. Instructivo de uso y lectura")
+    st.markdown("""
+    ### Objetivo
+    Esta herramienta permite comparar históricamente lo pagado, provisionado y proyectado por mes de novedad, concepto, tipo de hora, cargo homologado, CECO y área; además genera una predicción del mes en curso.
+
+    ### Regla de mes vencido
+    Las horas se pagan mes vencido: pago 05.2026 corresponde a novedad 04.2026. Por eso el comparativo se realiza por **mes de novedad**.
+
+    ### Homologación de cargos
+    La app intenta homologar por SAP + periodo usando el Headcount/MD del periodo. Si el SAP viene como Error, vacío o no cruza, usa la columna Función/Cargo del archivo y aplica la homologación. Si no encuentra equivalencia, lo reporta en alertas.
+
+    ### Predicción
+    Para costear la predicción, el MD calcula salario total vigente, lo divide por la jornada vigente y multiplica por el factor del concepto.
+
+    ### Lectura de valores
+    Los valores monetarios se muestran como pesos sin decimales y las cantidades con 2 decimales.
+    """)
+
+elif menu == "5. Plantillas":
     st.subheader("4. Plantillas de apoyo")
     st.write("Descarga estas plantillas si necesitas parametrizar cuentas o revisar factores.")
     st.download_button(
