@@ -20,7 +20,7 @@ except Exception:
 # =============================================================
 st.set_page_config(
     page_title="Comparativo y predicción de horas nómina",
-    page_icon="🧮",
+    page_icon="🦜",
     layout="wide",
 )
 
@@ -1454,22 +1454,115 @@ def build_alertas_comparativo(comp: pd.DataFrame, alerts_base: List[str], thresh
         rows.append({"tipo": "Desviación", "alerta": f"{len(desv):,.0f} combinaciones superan {threshold_pct:.0%} de desviación pagado vs provisión."})
     return standard_alert_df(rows)
 
+
+
+def filtro_multiseleccion(label: str, opciones: List[str], key: str, ayuda: str = "") -> List[str]:
+    """Selector liviano: vacío significa todos. Evita cargar la pantalla con todos los chips seleccionados."""
+    opciones = list(opciones or [])
+    seleccion = st.multiselect(
+        f"{label} (vacío = todos)",
+        opciones,
+        default=[],
+        key=key,
+        help=ayuda or "Deja este campo vacío para incluir todos los valores. Selecciona uno o varios para filtrar."
+    )
+    st.markdown(
+        f"<div class='filter-note'>{'Todos seleccionados' if not seleccion else str(len(seleccion)) + ' seleccionado(s)'}</div>",
+        unsafe_allow_html=True,
+    )
+    return seleccion if seleccion else opciones
+
+
+def aplicar_filtros_comparativo(comp: pd.DataFrame, f_periodos, f_conceptos, f_areas, f_tipos, f_cargos) -> pd.DataFrame:
+    filt = comp[
+        comp["periodo_novedad"].isin(f_periodos)
+        & comp["concepto"].isin(f_conceptos)
+        & comp["area_negocio"].isin(f_areas)
+        & comp["tipo_hora"].isin(f_tipos)
+        & comp["cargo_homologado"].isin(f_cargos)
+    ].copy()
+    return filt
+
 # =============================================================
 # UI
 # =============================================================
 st.markdown(
     """
     <style>
-    .main .block-container {padding-top: 1.5rem;}
+    :root {
+        --jmc-orange: #F05A28;
+        --jmc-orange-dark: #A74412;
+        --jmc-soft: #FFF3EC;
+        --jmc-border: #FFD7C2;
+    }
+    .main .block-container {padding-top: 1.1rem;}
     div[data-testid="stMetricValue"] {font-size: 1.4rem;}
     .small-note {font-size: 0.85rem; color: #666;}
+    .brand-header {
+        display: flex;
+        align-items: center;
+        gap: 0.9rem;
+        background: linear-gradient(90deg, var(--jmc-soft), #FFFFFF);
+        border-left: 8px solid var(--jmc-orange);
+        border-radius: 14px;
+        padding: 1rem 1.2rem;
+        margin-bottom: 0.9rem;
+        box-shadow: 0 1px 8px rgba(240, 90, 40, 0.08);
+    }
+    .brand-logo {
+        width: 3.2rem;
+        height: 3.2rem;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 999px;
+        background: #FFFFFF;
+        border: 2px solid var(--jmc-border);
+        font-size: 2rem;
+    }
+    .brand-title {
+        font-size: 2rem;
+        line-height: 1.1;
+        font-weight: 750;
+        color: #1F2937;
+        margin: 0;
+    }
+    .brand-subtitle {
+        color: #6B7280;
+        margin-top: 0.35rem;
+        font-size: 0.98rem;
+    }
+    div.stButton > button:first-child,
+    div.stDownloadButton > button:first-child {
+        border-color: var(--jmc-orange);
+    }
+    div.stButton > button[kind="primary"] {
+        background: var(--jmc-orange);
+        border-color: var(--jmc-orange);
+    }
+    .filter-note {
+        color: #6B7280;
+        font-size: 0.86rem;
+        margin-top: -0.35rem;
+        margin-bottom: 0.45rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("🧮 Comparativo y predicción de horas de nómina")
-st.caption("Pagado real vs provisión vs proyección + predicción del mes en curso por concepto, tipo hora, cargo homologado, CECO y área.")
+st.markdown(
+    """
+    <div class="brand-header">
+        <div class="brand-logo">🦜</div>
+        <div>
+            <div class="brand-title">Comparativo y predicción de horas de nómina</div>
+            <div class="brand-subtitle">Pagado real vs provisión vs proyección + predicción del mes en curso por concepto, tipo hora, cargo homologado, CECO y área.</div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 if "processed" not in st.session_state:
     st.session_state.processed = False
@@ -1532,6 +1625,10 @@ if menu == "1. Cargue y procesamiento":
         st.session_state.comparativo = comparativo
         st.session_state.alertas = alertas_df
         st.session_state.processed = True
+        # Limpia filtros/resúmenes anteriores para que el comparativo se regenere con las nuevas bases.
+        for _k in ["filt_comparativo", "resumenes_comparativo", "alertas_comparativo_filtrado", "threshold_comparativo"]:
+            if _k in st.session_state:
+                del st.session_state[_k]
         st.success("Bases procesadas correctamente.")
 
         m1, m2, m3, m4 = st.columns(4)
@@ -1551,31 +1648,43 @@ elif menu == "2. Comparativo histórico":
 
     comp = st.session_state.comparativo.copy()
     st.caption("Recuerda: el pagado real se compara por mes de novedad. Ejemplo: pago 05.2026 corresponde a novedad 04.2026.")
-    with st.expander("Filtros", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        periodos = sorted(comp["periodo_novedad"].dropna().unique(), key=period_sort_key)
-        conceptos = sorted(comp["concepto"].dropna().unique())
-        areas = sorted(comp["area_negocio"].dropna().unique())
-        tipos = sorted(comp["tipo_hora"].dropna().unique())
-        cargos = sorted(comp["cargo_homologado"].dropna().unique())
-        with c1:
-            f_periodos = st.multiselect("Mes novedad", periodos, default=periodos)
-            f_conceptos = st.multiselect("Concepto", conceptos, default=conceptos)
-        with c2:
-            f_areas = st.multiselect("Área negocio", areas, default=areas)
-            f_tipos = st.multiselect("Tipo hora", tipos, default=tipos)
-        with c3:
-            f_cargos = st.multiselect("Cargo homologado", cargos, default=[])
-            threshold = st.slider("Umbral alerta desviación", 0.05, 1.0, 0.15, 0.05)
 
-    filt = comp[
-        comp["periodo_novedad"].isin(f_periodos)
-        & comp["concepto"].isin(f_conceptos)
-        & comp["area_negocio"].isin(f_areas)
-        & comp["tipo_hora"].isin(f_tipos)
-    ].copy()
-    if f_cargos:
-        filt = filt[filt["cargo_homologado"].isin(f_cargos)].copy()
+    periodos = sorted(comp["periodo_novedad"].dropna().unique(), key=period_sort_key)
+    conceptos = sorted(comp["concepto"].dropna().unique())
+    areas = sorted(comp["area_negocio"].dropna().unique())
+    tipos = sorted(comp["tipo_hora"].dropna().unique())
+    cargos = sorted(comp["cargo_homologado"].dropna().unique())
+
+    with st.expander("Filtros", expanded=True):
+        st.info("Deja un filtro vacío para tomar todos los valores. Selecciona solo uno o varios cuando quieras acotar el análisis. Los filtros se aplican solo al presionar el botón.")
+        with st.form("form_filtros_comparativo"):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                f_periodos = filtro_multiseleccion("Mes novedad", periodos, "f_periodos")
+                f_conceptos = filtro_multiseleccion("Concepto", conceptos, "f_conceptos")
+            with c2:
+                f_areas = filtro_multiseleccion("Área negocio", areas, "f_areas")
+                f_tipos = filtro_multiseleccion("Tipo hora", tipos, "f_tipos")
+            with c3:
+                f_cargos = filtro_multiseleccion("Cargo homologado", cargos, "f_cargos")
+                threshold = st.slider("Umbral alerta desviación", 0.05, 1.0, 0.15, 0.05, key="threshold_comp")
+            aplicar = st.form_submit_button("🔎 Aplicar filtros", type="primary")
+
+    if aplicar or "filt_comparativo" not in st.session_state:
+        progress_f = st.progress(0, text="Aplicando filtros...")
+        filt = aplicar_filtros_comparativo(comp, f_periodos, f_conceptos, f_areas, f_tipos, f_cargos)
+        progress_f.progress(55, text="Calculando resúmenes...")
+        resumenes_tmp = resumenes_comparativo(filt)
+        progress_f.progress(85, text="Generando alertas...")
+        alertas_tmp = build_alertas_comparativo(filt, [], threshold)
+        progress_f.progress(100, text="Filtros aplicados")
+        st.session_state.filt_comparativo = filt
+        st.session_state.resumenes_comparativo = resumenes_tmp
+        st.session_state.alertas_comparativo_filtrado = alertas_tmp
+        st.session_state.threshold_comparativo = threshold
+    else:
+        filt = st.session_state.filt_comparativo
+        threshold = st.session_state.get("threshold_comparativo", 0.15)
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Valor pagado", f"${filt['valor_pagado'].sum():,.0f}")
@@ -1583,7 +1692,7 @@ elif menu == "2. Comparativo histórico":
     k3.metric("Valor proyección", f"${filt['valor_proyectado'].sum():,.0f}")
     k4.metric("Dif. pagado vs provisión", f"${filt['dif_valor_pagado_vs_provision'].sum():,.0f}")
 
-    resumenes = resumenes_comparativo(filt)
+    resumenes = st.session_state.get("resumenes_comparativo", resumenes_comparativo(filt))
     tab1, tab2, tab3, tab4 = st.tabs(["Resumen", "Gráficas", "Detalle", "Alertas / Descargar"])
     with tab1:
         st.markdown("#### Resumen por mes")
@@ -1605,7 +1714,7 @@ elif menu == "2. Comparativo histórico":
     with tab3:
         st.dataframe(filt, use_container_width=True, height=520)
     with tab4:
-        alertas = build_alertas_comparativo(filt, [], threshold)
+        alertas = st.session_state.get("alertas_comparativo_filtrado", build_alertas_comparativo(filt, [], threshold))
         st.dataframe(alertas, use_container_width=True)
         sheets = {"Comparativo_general": filt, **resumenes, "Alertas": alertas}
         if st.session_state.get("hom_df") is not None and not st.session_state.hom_df.empty:
