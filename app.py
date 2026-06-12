@@ -904,6 +904,18 @@ def aggregate_sources(pagado, provision, proyeccion, hc) -> pd.DataFrame:
 # PREDICCIÓN
 # =============================================================
 def process_md_actual(file_md, hom, jornada_default: float = 220.0) -> Tuple[pd.DataFrame, List[str]]:
+    """Procesa el MD actual para predicción.
+
+    Soporta dos formatos:
+    1) TXT SAP completo con varios renglones por persona/concepto.
+       Aplica la misma lógica del consolidador de salario vigente:
+       - Si la persona tiene Hasta = 31.12.9999, se usan SOLO esos registros vigentes.
+       - Si no tiene vigencia abierta, se usa la fecha máxima de Hasta.
+       - Dentro de esa vigencia, para cada SAP + concepto, toma el registro más reciente
+         ordenando por Modif.el desc y luego Importe desc.
+       - Salario total = conceptos base + bonos configurados en CONCEPTOS_SALARIO_MD.
+    2) Excel ya consolidado con columna Salario total.
+    """
     alerts = []
     if file_md is None:
         return pd.DataFrame(), ["No se cargó MD actual. No se podrá calcular costo por salario."]
@@ -919,30 +931,50 @@ def process_md_actual(file_md, hom, jornada_default: float = 220.0) -> Tuple[pd.
         col_area_nom = find_col(df, ["Área de nómina", "Area de nomina"], required=False)
         col_area_personal = find_col(df, ["Área de personal", "Area de personal"], required=False)
         col_div = find_col(df, ["División de personal", "Division de personal"], required=False)
-        col_sal_total = find_col(df, ["Salario total", "Total Salario", "Salario Total", "Salario_Total"], required=False)
+        col_sal_total = find_col(df, ["Salario total", "Total Salario", "Salario Total", "Salario_Total", "salario_total"], required=False)
         col_sal = find_col(df, ["Importe", "Salario", "Sueldo", "Sueldo Básico", "Sueldo Basico"], required=False)
         col_concepto = find_col(df, ["CC-nómina", "CC-nomina", "Concepto", "CC-n."], required=False)
         col_desde = find_col(df, ["Desde"], required=False)
         col_hasta = find_col(df, ["Hasta"], required=False)
+        col_modif = find_col(df, ["Modif.el", "Modif el", "Modificado el", "Fecha modificación", "Fecha modificacion"], required=False)
         col_jornada = find_col(df, ["Jornada mensual", "Horas mes", "H mes", "H mensual", "Jornada", "H sem."], required=False)
 
         work = df.copy()
+        work["_sap"] = work[col_sap].map(clean_code)
+        work = work[work["_sap"].astype(str).str.len() > 0].copy()
+
         if col_status:
             work = work[work[col_status].astype(str).str.upper().str.contains("ACTIVO", na=False)].copy()
 
-        # Si el MD viene desde SAP plano, trae varios renglones por persona y concepto. Primero dejamos vigentes.
-        if col_hasta:
-            hasta_txt = work[col_hasta].astype(str).str.strip()
-            vig = hasta_txt.eq("31.12.9999")
-            if vig.any():
-                work_vig = work[vig].copy()
-            else:
-                work_vig = work.copy()
-                work_vig["_hasta_dt"] = parse_sap_date_series(work_vig[col_hasta])
-                work_vig["_hasta_rank"] = work_vig.groupby(work_vig[col_sap].map(clean_code))["_hasta_dt"].transform("max")
-                work_vig = work_vig[work_vig["_hasta_dt"].eq(work_vig["_hasta_rank"])].copy()
+        if col_desde and col_desde in work.columns:
+            work["_desde_dt"] = parse_sap_date_series(work[col_desde])
+        else:
+            work["_desde_dt"] = pd.NaT
+        if col_hasta and col_hasta in work.columns:
+            work["_hasta_dt"] = parse_sap_date_series(work[col_hasta])
+            work["_hasta_txt"] = work[col_hasta].astype(str).str.strip()
+            work["_is_open"] = work["_hasta_txt"].eq("31.12.9999")
+        else:
+            work["_hasta_dt"] = pd.NaT
+            work["_is_open"] = False
+        if col_modif and col_modif in work.columns:
+            work["_modif_dt"] = parse_sap_date_series(work[col_modif])
+        else:
+            work["_modif_dt"] = pd.NaT
+
+        # Vigencia objetivo por persona, NO global:
+        # Si una persona tiene 31.12.9999, se queda con esa vigencia.
+        # Si no, toma su fecha máxima de Hasta.
+        if col_hasta and col_hasta in work.columns:
+            has_open = work.groupby("_sap")["_is_open"].transform("any")
+            max_hasta = work.groupby("_sap")["_hasta_dt"].transform("max")
+            keep_vig = (has_open & work["_is_open"]) | ((~has_open) & work["_hasta_dt"].eq(max_hasta))
+            work_vig = work[keep_vig].copy()
+            activos_abiertos = int(work_vig["_is_open"].any())
+            alerts.append("MD actual: apliqué vigencia por persona. Si existe Hasta = 31.12.9999 uso esa vigencia; si no existe, uso la fecha máxima de Hasta.")
         else:
             work_vig = work.copy()
+            alerts.append("MD actual: no encontré columna Hasta; no pude aplicar filtro de vigencia por persona.")
 
         # Excluye Manager I, II, III, IV para headcount/predicción.
         check_cols = [c for c in [col_area_personal, col_area_nom, col_cargo] if c and c in work_vig.columns]
@@ -953,21 +985,12 @@ def process_md_actual(file_md, hom, jornada_default: float = 220.0) -> Tuple[pd.
             if excl:
                 alerts.append(f"MD actual: se excluyeron {excl:,.0f} renglones Manager I-IV del universo de predicción.")
 
-        # Metadata: una fila por SAP.
-        sort_cols = []
-        if col_desde and col_desde in work_vig.columns:
-            work_vig["_desde_dt"] = parse_sap_date_series(work_vig[col_desde])
-            sort_cols.append("_desde_dt")
-        if col_hasta and col_hasta in work_vig.columns:
-            work_vig["_hasta_dt"] = parse_sap_date_series(work_vig[col_hasta])
-            sort_cols.append("_hasta_dt")
-        if sort_cols:
-            meta = work_vig.sort_values(sort_cols).drop_duplicates(col_sap, keep="last").copy()
-        else:
-            meta = work_vig.drop_duplicates(col_sap, keep="last").copy()
+        # Metadata: una fila por SAP. También toma la más reciente por Modif.el.
+        meta_sort = ["_hasta_dt", "_desde_dt", "_modif_dt"]
+        meta = work_vig.sort_values(meta_sort).drop_duplicates("_sap", keep="last").copy()
 
         out = pd.DataFrame()
-        out["sap"] = meta[col_sap].map(clean_code)
+        out["sap"] = meta["_sap"].map(clean_code)
         out["ceco"] = meta[col_ceco].map(clean_ceco) if col_ceco else ""
         out["funcion"] = meta[col_func].map(clean_code) if col_func else ""
         out["cargo_original"] = meta[col_cargo].astype(str) if col_cargo else ""
@@ -980,16 +1003,16 @@ def process_md_actual(file_md, hom, jornada_default: float = 220.0) -> Tuple[pd.
 
         # Salario Total:
         # 1) Si ya viene una columna Salario Total, se usa directo.
-        # 2) Si viene SAP plano con CC-nómina + Importe, se suman conceptos salariales vigentes por SAP.
+        # 2) Si viene SAP plano con CC-nómina + Importe, se suma el último registro vigente
+        #    por SAP + concepto, ordenado por Modif.el desc y luego Importe desc.
         if col_sal_total and col_sal_total in meta.columns:
-            sal_df = meta[[col_sap, col_sal_total]].copy()
-            sal_df["sap"] = sal_df[col_sap].map(clean_code)
+            sal_df = meta[["_sap", col_sal_total]].copy()
+            sal_df["sap"] = sal_df["_sap"].map(clean_code)
             sal_df["salario"] = to_num(sal_df[col_sal_total]).values
             out = out.merge(sal_df[["sap", "salario"]].drop_duplicates("sap"), on="sap", how="left")
             alerts.append("MD actual: usé la columna 'Salario total' del archivo cargado.")
         elif col_concepto and col_sal and col_concepto in work_vig.columns and col_sal in work_vig.columns:
             sal_work = work_vig.copy()
-            sal_work["_sap"] = sal_work[col_sap].map(clean_code)
             sal_work["_concepto_sal"] = sal_work[col_concepto].astype(str).str.strip().str.upper()
             sal_work["_importe_sal"] = to_num(sal_work[col_sal]).values
             sal_work = sal_work[sal_work["_concepto_sal"].isin(CONCEPTOS_SALARIO_MD)].copy()
@@ -997,10 +1020,16 @@ def process_md_actual(file_md, hom, jornada_default: float = 220.0) -> Tuple[pd.
                 out["salario"] = 0.0
                 alerts.append(f"MD actual: no encontré conceptos salariales {CONCEPTOS_SALARIO_MD}. Valor hora quedará en 0.")
             else:
-                sal_agg = sal_work.groupby(["_sap", "_concepto_sal"], dropna=False).agg(valor=("_importe_sal", "max")).reset_index()
-                sal_total = sal_agg.groupby("_sap", dropna=False).agg(salario=("valor", "sum")).reset_index().rename(columns={"_sap": "sap"})
+                # Esta es la regla crítica: último por SAP + concepto dentro de la vigencia objetivo.
+                sal_work = sal_work.sort_values(
+                    ["_sap", "_concepto_sal", "_modif_dt", "_importe_sal"],
+                    ascending=[True, True, False, False],
+                    na_position="last",
+                )
+                ultimo_concepto = sal_work.drop_duplicates(["_sap", "_concepto_sal"], keep="first").copy()
+                sal_total = ultimo_concepto.groupby("_sap", dropna=False).agg(salario=("_importe_sal", "sum")).reset_index().rename(columns={"_sap": "sap"})
                 out = out.merge(sal_total, on="sap", how="left")
-                alerts.append("MD actual: calculé 'Salario total' sumando conceptos salariales vigentes del TXT SAP.")
+                alerts.append("MD actual: calculé Salario total con el último registro vigente por SAP + concepto, ordenado por Modif.el desc e Importe desc.")
         elif col_sal and col_sal in meta.columns:
             out["salario"] = to_num(meta[col_sal]).values
             alerts.append("MD actual: no encontré 'Salario total'; usé la columna de salario/importe disponible en la fila única.")
@@ -1724,7 +1753,7 @@ elif menu == "4. Plantillas":
     - Provisión: `Source.Name/MES`, `CECO`, `CARGO`, `Valores`, `Total`, `PROVISIÓN`.
     - Proyección: `MES`, `Funcion`, `Ce.coste`, `Y220_Q`, `Y220_$`, etc.
     - Interface: 4 columnas sin encabezado: `SAP`, `Fecha pago`, `Concepto Y540-Y547`, `Cantidad`.
-    - MD actual: puede ser el TXT SAP completo o el Excel consolidado. Si viene TXT, la app calcula `Salario total` sumando conceptos salariales vigentes; si ya viene `Salario total`, lo usa directo. También usa `H sem.` para jornada vigente.
+    - MD actual: puede ser el TXT SAP completo o el Excel consolidado. Si viene TXT, aplica la lógica de salario vigente: vigencia por persona, último registro por SAP + concepto según `Modif.el` desc e `Importe` desc, suma salario base + bonos, calcula `Salario total`, jornada vigente y valor hora. Si ya viene `Salario total`, lo usa directo.
     """)
 
 st.caption("Creado por Andrés Huérfano Dávila - Nómina JMC")
