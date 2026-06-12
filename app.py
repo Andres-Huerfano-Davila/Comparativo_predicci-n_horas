@@ -29,7 +29,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_VERSION = "V14.3 - HC por conteo de posiciones homologadas por periodo + Provisión streaming + Predicción financiera"
+APP_VERSION = "V14.4 - Corrección HC por periodo + Provisión streaming + Predicción financiera"
 ORANGE = "#F26A21"
 BLUE = "#005AA9"
 GREEN = "#2E8B57"
@@ -612,7 +612,7 @@ def process_headcount(files: List[Any], concept_map: Dict[str, str], func_map: D
             c_func_text = find_col(df, ["Función.1", "Funcion.1", "Función_4", "Funcion_4"], False)
             file_name = getattr(f, "name", "")
             periodo = normalize_period_value("", file_name)
-            out = pd.DataFrame()
+            out = pd.DataFrame(index=df.index)
             out["archivo"] = file_name
             out["periodo_novedad"] = periodo
             out["sap"] = df[c_sap].apply(clean_sap)
@@ -802,7 +802,7 @@ def process_pagado(cc_files: List[Any], comp_files: List[Any], concept_map: Dict
             c_func_code = find_col(df, ["Función", " Funcion", "Función ", "Funcion"], False)
             c_func_text = find_col(df, ["Denominación función", "Denominacion funcion", "Función.1", "Funcion.1"], False)
 
-            out = pd.DataFrame()
+            out = pd.DataFrame(index=df.index)
             out["fuente"] = source
             out["archivo"] = f.name
             out["sap"] = df[c_sap].apply(clean_sap) if c_sap else ""
@@ -1119,7 +1119,7 @@ def process_proyeccion(files: List[Any], concept_map: Dict[str, str], func_map: 
                 alerts.append({"tipo":"Proyección", "mensaje":f"Proyección {f.name}: no se encontraron columnas *_Q / *_$ con movimiento"})
                 continue
             long = pd.concat(long_rows, ignore_index=True)
-            out = pd.DataFrame()
+            out = pd.DataFrame(index=long.index)
             out["fuente"] = "Proyección"
             out["archivo"] = f.name
             out["periodo_novedad"] = long[c_mes].apply(lambda x: parse_period_any(x, f.name)) if c_mes else parse_period_any("", f.name)
@@ -1574,7 +1574,7 @@ def read_md_actual(md_file, default_jornada: float, concept_map: Dict[str, str],
         c_desde = find_col(df, ["Desde"], False)
         c_hasta = find_col(df, ["Hasta"], False)
         c_modif = find_col(df, ["Modif.el", "Modif el", "Modificado el"], False)
-        out = pd.DataFrame()
+        out = pd.DataFrame(index=df.index)
         out["sap"] = df[c_sap].apply(clean_sap)
         out["status"] = df[c_status].apply(clean_text) if c_status else ""
         out["baja"] = df[c_baja].apply(clean_text) if c_baja else ""
@@ -1680,7 +1680,7 @@ def process_interfaces(interface_files: List[Any], concept_map: Dict[str, str], 
                 c_period = c_period or cols[1]
                 c_concept = c_concept or cols[2]
                 c_qty = c_qty or cols[3]
-            out = pd.DataFrame()
+            out = pd.DataFrame(index=df.index)
             out["fuente"] = "Interface"
             out["archivo"] = f.name
             out["sap"] = df[c_sap].apply(clean_sap) if c_sap else ""
@@ -1726,7 +1726,7 @@ def read_cuentas(cuenta_file) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
         c_ceco_pref = find_col(df, ["CECO inicio", "Prefijo CECO", "CECO", "Ceco"], False)
         c_cuenta = find_col(df, ["Cuenta", "Cuenta contable", "DKON"], True)
         c_desc = find_col(df, ["Descripción", "Descripcion", "Texto cuenta"], False)
-        out = pd.DataFrame()
+        out = pd.DataFrame(index=df.index)
         out["concepto"] = df[c_con].apply(clean_concept) if c_con else ""
         out["area_negocio"] = df[c_area].apply(clean_text) if c_area else ""
         out["ceco_prefijo"] = df[c_ceco_pref].apply(clean_code) if c_ceco_pref else ""
