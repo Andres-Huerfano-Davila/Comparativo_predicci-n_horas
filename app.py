@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Comparativo y predicción de horas de nómina - V12
+Comparativo y predicción de horas de nómina - V14
 Creado para comparar CCNómina pagada (mes vencido) vs provisión vs proyección,
 con homologación basada en Maestro Posición -> Función -> Cargo homologado.
 """
@@ -29,7 +29,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_VERSION = "V13 - Turbo provisión por agregación previa + Comparativo rápido + Predicción financiera"
+APP_VERSION = "V14.2 - Fix Headcount por periodo + Provisión streaming + Paquete homologado + Predicción financiera"
 ORANGE = "#F26A21"
 BLUE = "#005AA9"
 GREEN = "#2E8B57"
@@ -244,7 +244,31 @@ def parse_period_any(value: Any, fallback_name: str = "") -> str:
     return ""
 
 
+def normalize_period_value(value: Any, fallback_name: str = "") -> str:
+    """Normaliza cualquier período a MM.YYYY. Corrige casos como 1.2026 -> 01.2026."""
+    if pd.isna(value):
+        value = ""
+    s = str(value).strip()
+    if s in {"", "nan", "NaN", "None", "NULL"}:
+        s = ""
+    # Caso en que pandas leyó 01.2026 como float 1.2026
+    m = re.fullmatch(r"([1-9]|1[0-2])\.(20\d{2})", s)
+    if m:
+        return f"{int(m.group(1)):02d}.{m.group(2)}"
+    p = parse_period_any(s, fallback_name)
+    if p:
+        return p
+    # Último recurso: detectar un bloque de 6 dígitos en el nombre/valor
+    txt = f"{s} {fallback_name}"
+    for m in re.finditer(r"(?<!\d)(0[1-9]|1[0-2])(20\d{2})(?!\d)", txt):
+        return f"{m.group(1)}.{m.group(2)}"
+    for m in re.finditer(r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(?!\d)", txt):
+        return f"{m.group(2)}.{m.group(1)}"
+    return ""
+
+
 def prev_period(period: str) -> str:
+    period = normalize_period_value(period)
     if not period:
         return ""
     m = re.match(r"(0[1-9]|1[0-2])\.(20\d{2})", str(period))
@@ -330,6 +354,8 @@ def ensure_key_types(df: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
         if k not in df.columns:
             df[k] = ""
         df[k] = df[k].fillna("").astype(str)
+        if k.startswith("periodo"):
+            df[k] = df[k].apply(normalize_period_value)
     return df
 
 # ==============================
@@ -584,8 +610,10 @@ def process_headcount(files: List[Any], concept_map: Dict[str, str], func_map: D
             c_pos_text = find_col(df, ["Posición.1", "Posicion.1", "Posición_3", "Posicion_3"], False)
             c_func_code = find_col(df, ["Función", "Funcion"], False)
             c_func_text = find_col(df, ["Función.1", "Funcion.1", "Función_4", "Funcion_4"], False)
-            periodo = parse_period_any("", f.name)
+            file_name = getattr(f, "name", "")
+            periodo = normalize_period_value("", file_name)
             out = pd.DataFrame()
+            out["archivo"] = file_name
             out["periodo_novedad"] = periodo
             out["sap"] = df[c_sap].apply(clean_sap)
             out["status"] = df[c_status].apply(clean_text) if c_status else ""
@@ -607,6 +635,11 @@ def process_headcount(files: List[Any], concept_map: Dict[str, str], func_map: D
     hc_full = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
     if hc_full.empty:
         return hc_full, pd.DataFrame(), pd.DataFrame(), alerts
+    if "periodo_novedad" in hc_full.columns:
+        hc_full["periodo_novedad"] = hc_full.apply(lambda r: normalize_period_value(r.get("periodo_novedad", ""), r.get("archivo", "")), axis=1)
+    missing_period = int(hc_full["periodo_novedad"].eq("").sum()) if "periodo_novedad" in hc_full.columns else len(hc_full)
+    if missing_period:
+        alerts.append({"tipo":"Headcount", "mensaje":f"Headcount: {missing_period:,} registros sin mes detectado. Revise nombres de archivo; se requiere formato 012026, 01.2026 o 202601."})
     hc_full = hc_full[hc_full["sap"].ne("")].copy()
     excl = hc_full[hc_full["manager_excluido"]].copy()
     hc_valid = hc_full[~hc_full["manager_excluido"]].copy()
@@ -740,90 +773,199 @@ def process_pagado(cc_files: List[Any], comp_files: List[Any], concept_map: Dict
     return full, agg, alerts
 
 
+
+def _find_idx_from_headers(headers: List[str], candidates: List[str], required: bool = False) -> Optional[int]:
+    norm_headers = {norm_key(h): i for i, h in enumerate(headers)}
+    cand_norm = [norm_key(c) for c in candidates]
+    for cn in cand_norm:
+        if cn in norm_headers:
+            return norm_headers[cn]
+    for cn in cand_norm:
+        matches = [(i, h) for h, i in norm_headers.items() if cn and (cn in h or h in cn)]
+        if matches:
+            return sorted(matches, key=lambda x: len(x[1]))[0][0]
+    if required:
+        raise ValueError(f"No encontré columna para: {candidates}")
+    return None
+
+
+def _row_get(row: Tuple[Any, ...], idx: Optional[int], default: Any = "") -> Any:
+    if idx is None:
+        return default
+    if idx >= len(row):
+        return default
+    v = row[idx]
+    return default if v is None else v
+
+
+def _provision_from_dataframe_fast(df: pd.DataFrame, file_name: str, concept_map: Dict[str, str]) -> Tuple[pd.DataFrame, int]:
+    """Procesa provisión desde CSV/Parquet/DataFrame de forma vectorizada y agrega antes de homologar."""
+    df = drop_duplicated_columns(df)
+    c_source = find_col(df, ["Source.Name", "Source Name", "MES", "Periodo"], False)
+    c_ceco = find_col(df, ["CECO", "Ce.coste", "Ce coste"], False)
+    c_tipo = find_col(df, ["TIPO", "Tipo"], False)
+    c_cargo = find_col(df, ["CARGO", "Cargo"], True)
+    c_concept = find_col(df, ["Valores", "Concepto", "CC-n."], True)
+    c_qty = find_col(df, ["Total", "Cantidad"], True)
+    c_value = find_col(df, ["PROVISIÓN", "PROVISION", "Provisión", "Provision"], True)
+    c_region = find_col(df, ["REGION", "Región", "Division", "División"], False)
+
+    base = pd.DataFrame()
+    base["fuente"] = "Provisión"
+    base["archivo"] = file_name
+    base["periodo_novedad"] = df[c_source].apply(lambda x: parse_period_any(x, file_name)) if c_source else parse_period_any("", file_name)
+    base["ceco"] = df[c_ceco].apply(clean_code) if c_ceco else ""
+    cargo = df[c_cargo].apply(clean_text)
+    tipo = df[c_tipo].apply(clean_text) if c_tipo else pd.Series([""] * len(df), index=df.index)
+    region = df[c_region].apply(clean_text) if c_region else pd.Series([""] * len(df), index=df.index)
+    base["posicion_original"] = cargo
+    base["concepto"] = df[c_concept].apply(clean_concept)
+    base["tipo_hora"] = base["concepto"].map(concept_map).fillna(base["concepto"].map(CONCEPTOS)).fillna("Sin tipo hora")
+    base["cantidad_provisionada"] = df[c_qty].apply(parse_number)
+    base["valor_provisionado"] = df[c_value].apply(parse_number)
+    base["area_negocio"] = [classify_area(ceco, reg, ti, "", cg) for ceco, reg, ti, cg in zip(base["ceco"], region, tipo, cargo)]
+    base = base[base["concepto"].isin(CONCEPTOS_SET)].copy()
+    base = base[(base["cantidad_provisionada"].abs() > 0) | (base["valor_provisionado"].abs() > 0)].copy()
+    if base.empty:
+        return base, len(df)
+    group_cols = ["fuente", "archivo", "periodo_novedad", "area_negocio", "ceco", "posicion_original", "concepto", "tipo_hora"]
+    pre = base.groupby(group_cols, dropna=False).agg(
+        cantidad_provisionada=("cantidad_provisionada", "sum"),
+        valor_provisionado=("valor_provisionado", "sum"),
+    ).reset_index()
+    return pre, len(base)
+
+
+def _read_provision_streaming_excel(file_obj, concept_map: Dict[str, str]) -> Tuple[pd.DataFrame, int]:
+    """Lee provisión .xlsx/.xlsm en modo streaming con openpyxl.
+
+    Evita cargar toda la hoja en memoria como pandas.read_excel. Agrega mientras lee.
+    Esto es clave para Streamlit Cloud cuando el consolidado de provisión es grande.
+    """
+    from openpyxl import load_workbook
+
+    data = file_obj.getvalue()
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    # Buscar hoja Horas_Provisión de forma flexible
+    sheet_name = None
+    for sn in wb.sheetnames:
+        nk = norm_key(sn)
+        if "HORAS" in nk and "PROVISION" in nk:
+            sheet_name = sn
+            break
+    if sheet_name is None:
+        sheet_name = wb.sheetnames[0]
+    ws = wb[sheet_name]
+
+    header = None
+    header_row_number = None
+    # Buscar encabezado en primeras 30 filas
+    for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        vals = [clean_text(v) for v in row]
+        nk_join = " ".join(norm_key(v) for v in vals if v)
+        if ("CARGO" in nk_join and ("VALORES" in nk_join or "CONCEPTO" in nk_join) and ("PROVISION" in nk_join or "TOTAL" in nk_join)):
+            header = vals
+            header_row_number = i
+            break
+        if i >= 30:
+            break
+    if header is None:
+        wb.close()
+        raise ValueError("No encontré encabezado válido en la provisión. Debe tener CARGO, Valores/Concepto y PROVISIÓN/Total.")
+
+    i_source = _find_idx_from_headers(header, ["Source.Name", "Source Name", "MES", "Periodo"], False)
+    i_ceco = _find_idx_from_headers(header, ["CECO", "Ce.coste", "Ce coste"], False)
+    i_tipo = _find_idx_from_headers(header, ["TIPO", "Tipo"], False)
+    i_cargo = _find_idx_from_headers(header, ["CARGO", "Cargo"], True)
+    i_concept = _find_idx_from_headers(header, ["Valores", "Concepto", "CC-n."], True)
+    i_qty = _find_idx_from_headers(header, ["Total", "Cantidad"], True)
+    i_value = _find_idx_from_headers(header, ["PROVISIÓN", "PROVISION", "Provisión", "Provision"], True)
+    i_region = _find_idx_from_headers(header, ["REGION", "Región", "Division", "División"], False)
+
+    agg: Dict[Tuple[str, str, str, str, str, str, str, str], List[float]] = {}
+    useful = 0
+    scanned = 0
+    for r_idx, row in enumerate(ws.iter_rows(min_row=header_row_number + 1, values_only=True), start=header_row_number + 1):
+        scanned += 1
+        concepto = clean_concept(_row_get(row, i_concept))
+        if concepto not in CONCEPTOS_SET:
+            continue
+        qty = parse_number(_row_get(row, i_qty))
+        val = parse_number(_row_get(row, i_value))
+        if abs(qty) == 0 and abs(val) == 0:
+            continue
+        source_val = _row_get(row, i_source) if i_source is not None else ""
+        periodo = parse_period_any(source_val, file_obj.name)
+        ceco = clean_code(_row_get(row, i_ceco))
+        tipo = clean_text(_row_get(row, i_tipo))
+        cargo = clean_text(_row_get(row, i_cargo))
+        region = clean_text(_row_get(row, i_region))
+        area = classify_area(ceco, region, tipo, "", cargo)
+        tipo_hora = concept_map.get(concepto) or CONCEPTOS.get(concepto, "Sin tipo hora")
+        key = ("Provisión", file_obj.name, periodo, area, ceco, cargo, concepto, tipo_hora)
+        if key not in agg:
+            agg[key] = [0.0, 0.0]
+        agg[key][0] += qty
+        agg[key][1] += val
+        useful += 1
+    wb.close()
+    if not agg:
+        return pd.DataFrame(), useful
+    records = []
+    for (fuente, archivo, periodo, area, ceco, cargo, concepto, tipo_hora), (qty, val) in agg.items():
+        records.append({
+            "fuente": fuente, "archivo": archivo, "periodo_novedad": periodo,
+            "area_negocio": area, "ceco": ceco, "posicion_original": cargo,
+            "concepto": concepto, "tipo_hora": tipo_hora,
+            "cantidad_provisionada": qty, "valor_provisionado": val,
+        })
+    return pd.DataFrame.from_records(records), useful
+
+
+def _read_provision_preaggregated(file_obj, concept_map: Dict[str, str]) -> Tuple[pd.DataFrame, int, str]:
+    """Devuelve provisión ya agregada antes de homologar. Soporta XLSX streaming, CSV y Parquet."""
+    name = getattr(file_obj, "name", "archivo")
+    ext = os.path.splitext(name)[1].lower()
+    if ext == ".parquet":
+        df = pd.read_parquet(io.BytesIO(file_obj.getvalue()))
+        pre, useful = _provision_from_dataframe_fast(df, name, concept_map)
+        return pre, useful, "parquet"
+    if ext in [".csv", ".txt"]:
+        # separador flexible: intenta ; y luego ,
+        data = file_obj.getvalue()
+        for sep in [";", ",", "\t"]:
+            try:
+                df = pd.read_csv(io.BytesIO(data), sep=sep, dtype=str, encoding="utf-8-sig")
+                if df.shape[1] > 1:
+                    pre, useful = _provision_from_dataframe_fast(df, name, concept_map)
+                    return pre, useful, f"csv sep={sep!r}"
+            except Exception:
+                continue
+        df = pd.read_csv(io.BytesIO(data), dtype=str, encoding="latin1")
+        pre, useful = _provision_from_dataframe_fast(df, name, concept_map)
+        return pre, useful, "csv"
+    # Excel: streaming
+    pre, useful = _read_provision_streaming_excel(file_obj, concept_map)
+    return pre, useful, "excel_streaming"
+
+
 def process_provision(files: List[Any], concept_map: Dict[str, str], func_map: Dict[str, str], master: Dict[str, Dict[str, str]], hc_full: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict[str, Any]]]:
-    """Procesa provisión en modo turbo.
+    """Procesa provisión V14 en modo streaming/agregado.
 
-    Cambio clave V13:
-    - NO homologa 400k+ filas una a una.
-    - Lee solo columnas necesarias cuando es posible.
-    - Agrega primero por periodo/área/CECO/cargo/concepto.
-    - Homologa solo las combinaciones agregadas usando Maestro Posición -> Función -> Cargo homologado.
-
-    Esto mantiene la lógica de negocio y reduce de forma importante el tiempo en Streamlit Cloud.
+    - Para Excel usa openpyxl read_only y agrega fila a fila sin cargar toda la hoja.
+    - Para CSV/Parquet usa lectura rápida.
+    - Luego homologa únicamente las combinaciones agregadas.
     """
     rows = []
     alerts = []
 
-    def read_provision_needed_columns(file_obj):
-        # 1) intenta detectar columnas con una lectura pequeña
-        sheet = "Horas_Provisión"
-        try:
-            sample = read_excel_upload(file_obj, sheet_name=sheet, nrows=50)
-        except Exception:
-            sheet = 0
-            sample = read_excel_upload(file_obj, sheet_name=sheet, nrows=50)
-        sample = drop_duplicated_columns(sample)
-        c_source = find_col(sample, ["Source.Name", "Source Name", "MES", "Periodo"], False)
-        c_sap = find_col(sample, ["IdentificacionEmpleado", "IdentificaciónEmpleado", "SAP", "Nº pers."], False)
-        c_ceco = find_col(sample, ["CECO", "Ce.coste", "Ce coste"], False)
-        c_tipo = find_col(sample, ["TIPO", "Tipo"], False)
-        c_cargo = find_col(sample, ["CARGO", "Cargo"], True)
-        c_concept = find_col(sample, ["Valores", "Concepto", "CC-n."], True)
-        c_qty = find_col(sample, ["Total", "Cantidad"], True)
-        c_value = find_col(sample, ["PROVISIÓN", "PROVISION", "Provisión", "Provision"], True)
-        c_region = find_col(sample, ["REGION", "Región", "Division"], False)
-        needed = []
-        for c in [c_source, c_sap, c_ceco, c_tipo, c_cargo, c_concept, c_qty, c_value, c_region]:
-            if c and c not in needed:
-                needed.append(c)
-        # 2) lee solo columnas necesarias; si falla, lee todo como respaldo
-        try:
-            df = read_excel_upload(file_obj, sheet_name=sheet, usecols=needed)
-        except Exception:
-            df = read_excel_upload(file_obj, sheet_name=sheet)
-        return drop_duplicated_columns(df)
-
     for f in files or []:
         try:
-            df = read_provision_needed_columns(f)
-            c_source = find_col(df, ["Source.Name", "Source Name", "MES", "Periodo"], False)
-            c_ceco = find_col(df, ["CECO", "Ce.coste", "Ce coste"], False)
-            c_tipo = find_col(df, ["TIPO", "Tipo"], False)
-            c_cargo = find_col(df, ["CARGO", "Cargo"], True)
-            c_concept = find_col(df, ["Valores", "Concepto", "CC-n."], True)
-            c_qty = find_col(df, ["Total", "Cantidad"], True)
-            c_value = find_col(df, ["PROVISIÓN", "PROVISION", "Provisión", "Provision"], True)
-            c_region = find_col(df, ["REGION", "Región", "Division"], False)
-
-            base = pd.DataFrame()
-            base["fuente"] = "Provisión"
-            base["archivo"] = f.name
-            base["periodo_novedad"] = df[c_source].apply(lambda x: parse_period_any(x, f.name)) if c_source else parse_period_any("", f.name)
-            base["ceco"] = df[c_ceco].apply(clean_code) if c_ceco else ""
-            cargo = df[c_cargo].apply(clean_text)
-            tipo = df[c_tipo].apply(clean_text) if c_tipo else pd.Series([""] * len(df), index=df.index)
-            region = df[c_region].apply(clean_text) if c_region else pd.Series([""] * len(df), index=df.index)
-            base["posicion_original"] = cargo
-            base["concepto"] = df[c_concept].apply(clean_concept)
-            base["tipo_hora"] = base["concepto"].map(concept_map).fillna(base["concepto"].map(CONCEPTOS)).fillna("Sin tipo hora")
-            base["cantidad_provisionada"] = df[c_qty].apply(parse_number)
-            base["valor_provisionado"] = df[c_value].apply(parse_number)
-            base["area_negocio"] = [classify_area(ceco, reg, ti, "", cg) for ceco, reg, ti, cg in zip(base["ceco"], region, tipo, cargo)]
-            base = base[base["concepto"].isin(CONCEPTOS_SET)].copy()
-            base = base[(base["cantidad_provisionada"].abs() > 0) | (base["valor_provisionado"].abs() > 0)].copy()
-
-            if base.empty:
-                alerts.append({"tipo": "Cargue", "mensaje": f"Provisión {f.name}: sin registros útiles después de filtrar conceptos/valores."})
+            pre, useful_rows, mode = _read_provision_preaggregated(f, concept_map)
+            if pre.empty:
+                alerts.append({"tipo": "Cargue", "mensaje": f"Provisión {f.name}: sin registros útiles después de filtrar conceptos/valores. Modo: {mode}."})
                 continue
 
-            # Agregar antes de homologar para reducir millones/miles de filas a combinaciones reales.
-            group_cols = ["fuente", "archivo", "periodo_novedad", "area_negocio", "ceco", "posicion_original", "concepto", "tipo_hora"]
-            pre = base.groupby(group_cols, dropna=False).agg(
-                cantidad_provisionada=("cantidad_provisionada", "sum"),
-                valor_provisionado=("valor_provisionado", "sum"),
-            ).reset_index()
-
-            # Resolver función desde maestro Posición -> Función en modo vectorizado sobre combinaciones agregadas.
             func_codes = []
             func_names = []
             origins = []
@@ -831,7 +973,6 @@ def process_provision(files: List[Any], concept_map: Dict[str, str], func_map: D
             methods = []
             for pos, area in zip(pre["posicion_original"], pre["area_negocio"]):
                 fc, ft, origin = resolve_function_from_master(pos, master)
-                # Si el texto ya corresponde a una función conocida en Detalle Horas, úselo como función.
                 if not ft and not fc and norm_key(pos) in func_map:
                     ft = clean_text(pos)
                     origin = "texto_ya_es_funcion"
@@ -848,12 +989,12 @@ def process_provision(files: List[Any], concept_map: Dict[str, str], func_map: D
             pre["cargo_homologado"] = cargos
             pre["metodo_cargo"] = methods
 
-            pend = pre[pre["cargo_homologado"].isin(["", "Sin homologar"])]
+            pend = pre[pre["cargo_homologado"].isin(["", "Sin homologar", "Sin cargo"])]
             if len(pend):
                 alerts.append({"tipo": "Homologación", "mensaje": f"Provisión {f.name}: {len(pend):,} combinaciones agregadas quedaron sin cargo homologado."})
 
             rows.append(pre)
-            alerts.append({"tipo": "Cargue", "mensaje": f"Provisión {f.name}: {len(base):,} registros leídos; {len(pre):,} combinaciones agregadas homologadas en modo turbo."})
+            alerts.append({"tipo": "Cargue", "mensaje": f"Provisión {f.name}: {useful_rows:,} filas útiles leídas; {len(pre):,} combinaciones agregadas. Modo {mode}."})
         except Exception as e:
             alerts.append({"tipo": "Error", "mensaje": f"Error procesando provisión {getattr(f,'name','archivo')}: {e}"})
 
@@ -867,7 +1008,6 @@ def process_provision(files: List[Any], concept_map: Dict[str, str], func_map: D
     ).reset_index()
     agg = ensure_key_types(agg, KEY_DETAIL)
     return full, agg, alerts
-
 
 def process_proyeccion(files: List[Any], concept_map: Dict[str, str], func_map: Dict[str, str], master: Dict[str, Dict[str, str]], hc_full: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict[str, Any]]]:
     rows = []
@@ -1746,6 +1886,12 @@ def build_prediction(res: Dict[str, Any], interface_files: List[Any], md_file, c
     }
 
 
+
+
+# Compatibilidad con versiones V12/V13 que llamaban make_excel_report
+def make_excel_report(report: Dict[str, pd.DataFrame], extras: Dict[str, pd.DataFrame]) -> bytes:
+    return make_excel(report, extras)
+
 def make_prediction_excel(pred: Dict[str, pd.DataFrame]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -1804,6 +1950,10 @@ def process_all_v11(inputs: Dict[str, List[Any]], umbral: float = 15.0) -> Dict[
 def _df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     if df is None:
         df = pd.DataFrame()
+    df = df.copy()
+    for c in df.columns:
+        if str(c).lower().startswith("periodo"):
+            df[c] = df[c].apply(normalize_period_value)
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
@@ -1818,7 +1968,9 @@ def _csv_bytes_to_df(data: bytes) -> pd.DataFrame:
     ]
     for c in df.columns:
         lc = str(c).lower()
-        if any(tok in lc for tok in numeric_tokens) and not lc.startswith("periodo") and c not in ["concepto", "cuenta", "ceco", "sap"]:
+        if lc.startswith("periodo"):
+            df[c] = df[c].apply(normalize_period_value)
+        elif any(tok in lc for tok in numeric_tokens) and c not in ["concepto", "cuenta", "ceco", "sap"]:
             df[c] = df[c].apply(parse_number)
     return df
 
@@ -1860,7 +2012,7 @@ def dfs_to_maps(dfs: Dict[str, pd.DataFrame]) -> Tuple[Dict[str, str], Dict[str,
 def make_homologated_package(res: Dict[str, Any]) -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("README.txt", "Paquete homologado generado por Comparativo y predicción de horas de nómina V12. Cargar este ZIP en el módulo de comparativo para análisis rápido.\n")
+        zf.writestr("README.txt", "Paquete homologado generado por Comparativo y predicción de horas de nómina V14. Cargar este ZIP en el módulo de comparativo para análisis rápido.\n")
         for name, df in res.get("report", {}).items():
             zf.writestr(f"report/{name}.csv", _df_to_csv_bytes(df))
         for name, df in res.get("extras", {}).items():
@@ -1970,7 +2122,7 @@ if page == "1. Preparar paquete homologado":
         compensatorios = st.file_uploader("Compensatorios - Pagado Y350 (cargue múltiple)", type=["xls", "xlsx", "txt", "csv"], accept_multiple_files=True, key="prep_comp")
     with c2:
         headcount = st.file_uploader("Headcount mensual (cargue múltiple)", type=["xlsx", "xlsm", "xls"], accept_multiple_files=True, key="prep_hc")
-        provision = st.file_uploader("Consolidado Provisión", type=["xlsx", "xlsm"], accept_multiple_files=True, key="prep_prov")
+        provision = st.file_uploader("Consolidado Provisión (Excel, CSV o Parquet)", type=["xlsx", "xlsm", "csv", "parquet"], accept_multiple_files=True, key="prep_prov")
         proyeccion = st.file_uploader("Consolidado Proyección", type=["xlsx", "xlsm"], accept_multiple_files=True, key="prep_proy")
     st.info("Recomendación: después de generar el paquete homologado, descárgalo y úsalo para análisis. Así los filtros y gráficas no reprocesan Excel pesados.")
     if st.button("⚙️ Procesar y generar paquete homologado", type="primary", width="stretch"):
@@ -1997,7 +2149,7 @@ if page == "1. Preparar paquete homologado":
                 st.exception(e)
     if st.session_state.get("paquete_v12_bytes"):
         st.download_button(
-            "⬇️ Descargar paquete_homologado_v12.zip",
+            "⬇️ Descargar paquete_homologado_v14.zip",
             data=st.session_state["paquete_v12_bytes"],
             file_name=f"paquete_homologado_horas_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
             mime="application/zip",
@@ -2015,7 +2167,7 @@ if page == "1. Preparar paquete homologado":
 
 elif page == "2. Cargar paquete y comparar":
     st.subheader("2. Cargar paquete y comparar")
-    paquete = st.file_uploader("Cargar paquete homologado V12 (.zip)", type=["zip"], accept_multiple_files=False, key="load_pkg")
+    paquete = st.file_uploader("Cargar paquete homologado V14 (.zip)", type=["zip"], accept_multiple_files=False, key="load_pkg")
     if paquete is not None:
         if st.button("📦 Cargar paquete homologado", type="primary"):
             try:
@@ -2072,10 +2224,10 @@ elif page == "2. Cargar paquete y comparar":
             with tab3:
                 display_df(report.get("Indicadores_HC", pd.DataFrame()))
             with tab4:
-                excel_bytes = make_excel_report(report, res.get("extras", {}))
+                excel_bytes = make_excel(report, res.get("extras", {}))
                 st.download_button("⬇️ Descargar Excel comparativo", excel_bytes, "comparativo_horas_homologado.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
                 if st.session_state.get("paquete_v12_bytes"):
-                    st.download_button("⬇️ Descargar paquete homologado", st.session_state["paquete_v12_bytes"], "paquete_homologado_v12.zip", mime="application/zip", width="stretch")
+                    st.download_button("⬇️ Descargar paquete homologado", st.session_state["paquete_v12_bytes"], "paquete_homologado_v14.zip", mime="application/zip", width="stretch")
 
 elif page == "3. Predicción financiera":
     st.subheader("3. Predicción financiera del mes en curso")
