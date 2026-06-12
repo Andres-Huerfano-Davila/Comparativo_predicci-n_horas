@@ -2073,6 +2073,42 @@ def build_prediction(res: Dict[str, Any], interface_files: List[Any], md_file, c
 def make_excel_report(report: Dict[str, pd.DataFrame], extras: Dict[str, pd.DataFrame]) -> bytes:
     return make_excel(report, extras)
 
+
+
+# Compatibilidad UI V14.6: alias para el módulo de predicción
+def predict_current_month(res: Dict[str, Any], periodo_pred: str, interface_files: List[Any], md_file, cuentas_file, factores_df: pd.DataFrame, default_jornada: float, pesos: Dict[str, float], calendario: Dict[str, float]) -> Dict[str, pd.DataFrame]:
+    """Wrapper estable para la pantalla de predicción.
+    La función base es build_prediction; este alias conserva el nombre usado por la UI.
+    """
+    p_interface = float(pesos.get("interface", 0.40) or 0)
+    p_ultimo = float(pesos.get("ultimo", 0.30) or 0)
+    p_hist = float(pesos.get("historico", 0.20) or 0)
+    p_plan = float(pesos.get("plan", 0.10) or 0)
+    pesos_base = {
+        "interface": p_interface,
+        "historico": p_ultimo + p_hist,
+        "proyeccion": p_plan / 2,
+        "provision": p_plan / 2,
+    }
+    dias_mes = int(float(calendario.get("dias_mes", 30) or 30))
+    domingos = int(float(calendario.get("domingos", 4) or 4))
+    festivos = int(float(calendario.get("festivos", 0) or 0))
+    return build_prediction(
+        res=res,
+        interface_files=interface_files or [],
+        md_file=md_file,
+        cuenta_file=cuentas_file,
+        periodo_prediccion=periodo_pred,
+        default_jornada=default_jornada,
+        factores_df=factores_df,
+        pesos=pesos_base,
+        factor_cal=1.0,
+        dias_mes=dias_mes,
+        domingos=domingos,
+        festivos=festivos,
+    )
+
+
 def make_prediction_excel(pred: Dict[str, pd.DataFrame]) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
