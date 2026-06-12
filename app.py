@@ -29,7 +29,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_VERSION = "V12 - Preparador homologado + Comparativo rápido + Predicción financiera"
+APP_VERSION = "V13 - Turbo provisión por agregación previa + Comparativo rápido + Predicción financiera"
 ORANGE = "#F26A21"
 BLUE = "#005AA9"
 GREEN = "#2E8B57"
@@ -741,18 +741,52 @@ def process_pagado(cc_files: List[Any], comp_files: List[Any], concept_map: Dict
 
 
 def process_provision(files: List[Any], concept_map: Dict[str, str], func_map: Dict[str, str], master: Dict[str, Dict[str, str]], hc_full: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict[str, Any]]]:
+    """Procesa provisión en modo turbo.
+
+    Cambio clave V13:
+    - NO homologa 400k+ filas una a una.
+    - Lee solo columnas necesarias cuando es posible.
+    - Agrega primero por periodo/área/CECO/cargo/concepto.
+    - Homologa solo las combinaciones agregadas usando Maestro Posición -> Función -> Cargo homologado.
+
+    Esto mantiene la lógica de negocio y reduce de forma importante el tiempo en Streamlit Cloud.
+    """
     rows = []
     alerts = []
+
+    def read_provision_needed_columns(file_obj):
+        # 1) intenta detectar columnas con una lectura pequeña
+        sheet = "Horas_Provisión"
+        try:
+            sample = read_excel_upload(file_obj, sheet_name=sheet, nrows=50)
+        except Exception:
+            sheet = 0
+            sample = read_excel_upload(file_obj, sheet_name=sheet, nrows=50)
+        sample = drop_duplicated_columns(sample)
+        c_source = find_col(sample, ["Source.Name", "Source Name", "MES", "Periodo"], False)
+        c_sap = find_col(sample, ["IdentificacionEmpleado", "IdentificaciónEmpleado", "SAP", "Nº pers."], False)
+        c_ceco = find_col(sample, ["CECO", "Ce.coste", "Ce coste"], False)
+        c_tipo = find_col(sample, ["TIPO", "Tipo"], False)
+        c_cargo = find_col(sample, ["CARGO", "Cargo"], True)
+        c_concept = find_col(sample, ["Valores", "Concepto", "CC-n."], True)
+        c_qty = find_col(sample, ["Total", "Cantidad"], True)
+        c_value = find_col(sample, ["PROVISIÓN", "PROVISION", "Provisión", "Provision"], True)
+        c_region = find_col(sample, ["REGION", "Región", "Division"], False)
+        needed = []
+        for c in [c_source, c_sap, c_ceco, c_tipo, c_cargo, c_concept, c_qty, c_value, c_region]:
+            if c and c not in needed:
+                needed.append(c)
+        # 2) lee solo columnas necesarias; si falla, lee todo como respaldo
+        try:
+            df = read_excel_upload(file_obj, sheet_name=sheet, usecols=needed)
+        except Exception:
+            df = read_excel_upload(file_obj, sheet_name=sheet)
+        return drop_duplicated_columns(df)
+
     for f in files or []:
         try:
-            # Buscar hoja Horas_Provisión, si no existe primera hoja
-            try:
-                df = read_excel_upload(f, sheet_name="Horas_Provisión")
-            except Exception:
-                df = read_any_upload(f)
-            df = drop_duplicated_columns(df)
+            df = read_provision_needed_columns(f)
             c_source = find_col(df, ["Source.Name", "Source Name", "MES", "Periodo"], False)
-            c_sap = find_col(df, ["IdentificacionEmpleado", "IdentificaciónEmpleado", "SAP", "Nº pers."], False)
             c_ceco = find_col(df, ["CECO", "Ce.coste", "Ce coste"], False)
             c_tipo = find_col(df, ["TIPO", "Tipo"], False)
             c_cargo = find_col(df, ["CARGO", "Cargo"], True)
@@ -761,34 +795,76 @@ def process_provision(files: List[Any], concept_map: Dict[str, str], func_map: D
             c_value = find_col(df, ["PROVISIÓN", "PROVISION", "Provisión", "Provision"], True)
             c_region = find_col(df, ["REGION", "Región", "Division"], False)
 
-            out = pd.DataFrame()
-            out["fuente"] = "Provisión"
-            out["archivo"] = f.name
-            out["periodo_novedad"] = df[c_source].apply(lambda x: parse_period_any(x, f.name)) if c_source else parse_period_any("", f.name)
-            out["sap"] = df[c_sap].apply(clean_sap) if c_sap else ""
-            out["ceco"] = df[c_ceco].apply(clean_code) if c_ceco else ""
+            base = pd.DataFrame()
+            base["fuente"] = "Provisión"
+            base["archivo"] = f.name
+            base["periodo_novedad"] = df[c_source].apply(lambda x: parse_period_any(x, f.name)) if c_source else parse_period_any("", f.name)
+            base["ceco"] = df[c_ceco].apply(clean_code) if c_ceco else ""
             cargo = df[c_cargo].apply(clean_text)
-            tipo = df[c_tipo].apply(clean_text) if c_tipo else pd.Series([""]*len(df))
-            region = df[c_region].apply(clean_text) if c_region else pd.Series([""]*len(df))
-            out["posicion_original"] = cargo
-            out["funcion_codigo"] = ""
-            out["funcion_nombre"] = ""
-            out["concepto"] = df[c_concept].apply(clean_concept)
-            out["tipo_hora"] = out["concepto"].map(concept_map).fillna(out["concepto"].map(CONCEPTOS)).fillna("Sin tipo hora")
-            out["cantidad_provisionada"] = df[c_qty].apply(parse_number)
-            out["valor_provisionado"] = df[c_value].apply(parse_number)
-            out["area_negocio"] = [classify_area(ceco, reg, ti, "", cg) for ceco, reg, ti, cg in zip(out["ceco"], region, tipo, cargo)]
-            out = out[out["concepto"].isin(CONCEPTOS_SET)].copy()
-            out = out[(out["cantidad_provisionada"].abs() > 0) | (out["valor_provisionado"].abs() > 0)].copy()
-            out = add_function_and_cargo(out, "Provisión", master, func_map, hc_full, alerts, prefer_sap=True)
-            rows.append(out)
-            alerts.append({"tipo":"Cargue", "mensaje":f"Provisión {f.name}: {len(out):,} registros útiles procesados"})
+            tipo = df[c_tipo].apply(clean_text) if c_tipo else pd.Series([""] * len(df), index=df.index)
+            region = df[c_region].apply(clean_text) if c_region else pd.Series([""] * len(df), index=df.index)
+            base["posicion_original"] = cargo
+            base["concepto"] = df[c_concept].apply(clean_concept)
+            base["tipo_hora"] = base["concepto"].map(concept_map).fillna(base["concepto"].map(CONCEPTOS)).fillna("Sin tipo hora")
+            base["cantidad_provisionada"] = df[c_qty].apply(parse_number)
+            base["valor_provisionado"] = df[c_value].apply(parse_number)
+            base["area_negocio"] = [classify_area(ceco, reg, ti, "", cg) for ceco, reg, ti, cg in zip(base["ceco"], region, tipo, cargo)]
+            base = base[base["concepto"].isin(CONCEPTOS_SET)].copy()
+            base = base[(base["cantidad_provisionada"].abs() > 0) | (base["valor_provisionado"].abs() > 0)].copy()
+
+            if base.empty:
+                alerts.append({"tipo": "Cargue", "mensaje": f"Provisión {f.name}: sin registros útiles después de filtrar conceptos/valores."})
+                continue
+
+            # Agregar antes de homologar para reducir millones/miles de filas a combinaciones reales.
+            group_cols = ["fuente", "archivo", "periodo_novedad", "area_negocio", "ceco", "posicion_original", "concepto", "tipo_hora"]
+            pre = base.groupby(group_cols, dropna=False).agg(
+                cantidad_provisionada=("cantidad_provisionada", "sum"),
+                valor_provisionado=("valor_provisionado", "sum"),
+            ).reset_index()
+
+            # Resolver función desde maestro Posición -> Función en modo vectorizado sobre combinaciones agregadas.
+            func_codes = []
+            func_names = []
+            origins = []
+            cargos = []
+            methods = []
+            for pos, area in zip(pre["posicion_original"], pre["area_negocio"]):
+                fc, ft, origin = resolve_function_from_master(pos, master)
+                # Si el texto ya corresponde a una función conocida en Detalle Horas, úselo como función.
+                if not ft and not fc and norm_key(pos) in func_map:
+                    ft = clean_text(pos)
+                    origin = "texto_ya_es_funcion"
+                cargo_hom, metodo = homologate_function(fc, ft if ft else pos, func_map, area)
+                func_codes.append(fc)
+                func_names.append(ft if ft else clean_text(pos))
+                origins.append(origin)
+                cargos.append(cargo_hom)
+                methods.append(metodo)
+            pre["sap"] = ""
+            pre["funcion_codigo_final"] = func_codes
+            pre["funcion_nombre_final"] = func_names
+            pre["origen_funcion"] = origins
+            pre["cargo_homologado"] = cargos
+            pre["metodo_cargo"] = methods
+
+            pend = pre[pre["cargo_homologado"].isin(["", "Sin homologar"])]
+            if len(pend):
+                alerts.append({"tipo": "Homologación", "mensaje": f"Provisión {f.name}: {len(pend):,} combinaciones agregadas quedaron sin cargo homologado."})
+
+            rows.append(pre)
+            alerts.append({"tipo": "Cargue", "mensaje": f"Provisión {f.name}: {len(base):,} registros leídos; {len(pre):,} combinaciones agregadas homologadas en modo turbo."})
         except Exception as e:
-            alerts.append({"tipo":"Error", "mensaje":f"Error procesando provisión {getattr(f,'name','archivo')}: {e}"})
+            alerts.append({"tipo": "Error", "mensaje": f"Error procesando provisión {getattr(f,'name','archivo')}: {e}"})
+
     full = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
     if full.empty:
         return full, pd.DataFrame(), alerts
-    agg = full.groupby(KEY_DETAIL, dropna=False).agg(cantidad_provisionada=("cantidad_provisionada","sum"), valor_provisionado=("valor_provisionado","sum")).reset_index()
+    full = ensure_key_types(full, KEY_DETAIL)
+    agg = full.groupby(KEY_DETAIL, dropna=False).agg(
+        cantidad_provisionada=("cantidad_provisionada", "sum"),
+        valor_provisionado=("valor_provisionado", "sum"),
+    ).reset_index()
     agg = ensure_key_types(agg, KEY_DETAIL)
     return full, agg, alerts
 
