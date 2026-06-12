@@ -29,7 +29,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_VERSION = "V11 - Comparativo + Predicción financiera"
+APP_VERSION = "V11.1 - Comparativo + Predicción financiera"
 ORANGE = "#F26A21"
 BLUE = "#005AA9"
 GREEN = "#2E8B57"
@@ -1055,7 +1055,7 @@ def display_df(df: pd.DataFrame, name: str = "tabla", max_rows: int = MAX_SCREEN
     if total > max_rows:
         st.warning(f"Se muestran las primeras {max_rows:,} filas de {total:,}. Descarga el Excel para revisar el detalle completo.")
     height = min(650, max(240, 38 * (len(show) + 1)))
-    st.dataframe(pretty_df(show), use_container_width=True, height=int(height))
+    st.dataframe(pretty_df(show), width="stretch", height=int(height))
 
 
 def filter_df(df: pd.DataFrame, filters: Dict[str, List[str]]) -> pd.DataFrame:
@@ -1730,7 +1730,7 @@ if "prediccion_v11" not in st.session_state:
     st.session_state["prediccion_v11"] = None
 
 with st.sidebar:
-    st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/9/9b/Ara_macao_-Costa_Rica-8.jpg/320px-Ara_macao_-Costa_Rica-8.jpg", width=110)
+    st.markdown("<div style='font-size:54px; line-height:1;'>🦜</div>", unsafe_allow_html=True)
     st.markdown("### Menú")
     page = st.radio(
         "Ir a",
@@ -1754,7 +1754,7 @@ if page == "1. Cargue y procesamiento":
         provision = st.file_uploader("Consolidado Provisión", type=["xlsx", "xlsm"], accept_multiple_files=True)
         proyeccion = st.file_uploader("Consolidado Proyección", type=["xlsx", "xlsm"], accept_multiple_files=True)
     st.info("La predicción se habilita después de procesar el comparativo. Posiciones homologadas es opcional: si no se carga, se arma desde los Headcount.")
-    if st.button("🚀 Procesar comparativo", type="primary", use_container_width=True):
+    if st.button("🚀 Procesar comparativo", type="primary", width="stretch"):
         if not detalle:
             st.error("Debes cargar Detalle Horas / Homologación.")
         elif not headcount:
@@ -1825,7 +1825,7 @@ elif page == "2. Comparativo histórico":
         st.markdown("### Resumen por cargo homologado")
         display_df(filter_df(report.get("Resumen_Cargo_Homologado", pd.DataFrame()), {"periodo_novedad": sel_meses, "area_negocio": sel_areas, "cargo_homologado": sel_cargos}))
         excel_bytes = make_excel(report, res["extras"])
-        st.download_button("📥 Descargar Excel comparativo", excel_bytes, file_name=f"comparativo_horas_nomina_{datetime.now():%Y%m%d_%H%M}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.download_button("📥 Descargar Excel comparativo", excel_bytes, file_name=f"comparativo_horas_nomina_{datetime.now():%Y%m%d_%H%M}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
 
 elif page == "3. Predicción mes en curso":
     st.subheader("3. Predicción mes en curso")
@@ -1857,8 +1857,8 @@ elif page == "3. Predicción mes en curso":
         with c2:
             cuentas_file = st.file_uploader("Tabla de cuentas contables (opcional)", type=["xlsx", "xlsm", "xls", "csv", "txt"], accept_multiple_files=False)
             st.markdown("#### Factores por concepto")
-            factores_edit = st.data_editor(DEFAULT_FACTORES, use_container_width=True, num_rows="dynamic")
-        if st.button("📈 Generar predicción", type="primary", use_container_width=True):
+            factores_edit = st.data_editor(DEFAULT_FACTORES, width="stretch", num_rows="dynamic")
+        if st.button("📈 Generar predicción", type="primary", width="stretch"):
             try:
                 pesos = {"interface": peso_interface, "historico": peso_hist, "proyeccion": peso_proy, "provision": peso_prov}
                 pred = build_prediction(
@@ -1900,7 +1900,7 @@ elif page == "3. Predicción mes en curso":
                 display_df(pred.get("Alertas_Prediccion", pd.DataFrame()), max_rows=2000)
             with tabs[4]:
                 display_df(pred.get("MD_Valor_Hora", pd.DataFrame()), max_rows=5000)
-            st.download_button("📥 Descargar Excel predicción", make_prediction_excel(pred), file_name=f"prediccion_horas_{periodo_pred.replace('.', '')}_{datetime.now():%Y%m%d_%H%M}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+            st.download_button("📥 Descargar Excel predicción", make_prediction_excel(pred), file_name=f"prediccion_horas_{periodo_pred.replace('.', '')}_{datetime.now():%Y%m%d_%H%M}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
 
 elif page == "4. Diagnóstico y alertas":
     st.subheader("4. Diagnóstico y alertas")
