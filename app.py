@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Comparativo y predicción de horas de nómina - V10 final
+Comparativo y predicción de horas de nómina - V11
 Creado para comparar CCNómina pagada (mes vencido) vs provisión vs proyección,
 con homologación basada en Maestro Posición -> Función -> Cargo homologado.
 """
@@ -29,7 +29,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_VERSION = "V10 final - Maestro Posición → Función"
+APP_VERSION = "V11 - Comparativo + Predicción financiera"
 ORANGE = "#F26A21"
 BLUE = "#005AA9"
 GREEN = "#2E8B57"
@@ -1181,22 +1181,568 @@ def process_all(inputs: Dict[str, List[Any]], umbral: float = 15.0) -> Dict[str,
         }
     }
 
+
 # ==============================
-# UI
+# Predicción financiera - V11
 # ==============================
-if "resultado_v10" not in st.session_state:
-    st.session_state["resultado_v10"] = None
+DEFAULT_FACTORES = pd.DataFrame([
+    {"concepto": "Y220", "tipo_hora": "Rec. Noc.", "factor_concepto": 0.35},
+    {"concepto": "Y221", "tipo_hora": "Rec. Dom noc", "factor_concepto": 1.10},
+    {"concepto": "Y300", "tipo_hora": "Hora Extra", "factor_concepto": 1.25},
+    {"concepto": "Y305", "tipo_hora": "Hora Extra", "factor_concepto": 1.75},
+    {"concepto": "Y310", "tipo_hora": "Hora Extra", "factor_concepto": 2.00},
+    {"concepto": "Y315", "tipo_hora": "Hora Extra", "factor_concepto": 2.50},
+    {"concepto": "Y350", "tipo_hora": "Compensatorio", "factor_concepto": 1.00},
+    {"concepto": "YM01", "tipo_hora": "Rec. Dom", "factor_concepto": 0.75},
+])
+
+CONCEPTOS_SALARIO_BASE = {"Y050", "Y010", "Y090", "Y011", "Y051", "Y020"}
+CONCEPTOS_BONOS = {"Y506", "Y610", "Y618", "Y617"}
+CONCEPTOS_SALARIALES = CONCEPTOS_SALARIO_BASE | CONCEPTOS_BONOS
+
+
+def period_to_year_month(period: str) -> Tuple[int, int]:
+    m = re.match(r"(0[1-9]|1[0-2])\.(20\d{2})", str(period))
+    if not m:
+        return 0, 0
+    return int(m.group(2)), int(m.group(1))
+
+
+def next_period(period: str) -> str:
+    y, m = period_to_year_month(period)
+    if not y:
+        return ""
+    m += 1
+    if m == 13:
+        m = 1
+        y += 1
+    return f"{m:02d}.{y}"
+
+
+def date_from_period(period: str, day: int = 1) -> pd.Timestamp:
+    y, m = period_to_year_month(period)
+    if not y:
+        return pd.NaT
+    import calendar as _cal
+    last = _cal.monthrange(y, m)[1]
+    return pd.Timestamp(year=y, month=m, day=min(day, last))
+
+
+def suggest_calendar(period: str) -> Dict[str, int]:
+    import calendar as _cal
+    y, m = period_to_year_month(period)
+    if not y:
+        return {"dias_mes": 30, "domingos": 4, "festivos": 0}
+    dias_mes = _cal.monthrange(y, m)[1]
+    domingos = sum(1 for d in range(1, dias_mes + 1) if pd.Timestamp(year=y, month=m, day=d).weekday() == 6)
+    festivos = 0
+    try:
+        import holidays
+        co_holidays = holidays.country_holidays("CO", years=[y])
+        festivos = sum(1 for d in range(1, dias_mes + 1) if pd.Timestamp(year=y, month=m, day=d).date() in co_holidays)
+    except Exception:
+        festivos = 0
+    return {"dias_mes": int(dias_mes), "domingos": int(domingos), "festivos": int(festivos)}
+
+
+def to_datetime_sap(s: Any) -> pd.Timestamp:
+    if pd.isna(s):
+        return pd.NaT
+    if isinstance(s, (pd.Timestamp, datetime)):
+        return pd.Timestamp(s)
+    txt = str(s).strip()
+    if not txt:
+        return pd.NaT
+    return pd.to_datetime(txt, dayfirst=True, errors="coerce")
+
+
+def read_md_actual(md_file, default_jornada: float, concept_map: Dict[str, str], func_map: Dict[str, str], master: Dict[str, Dict[str, str]]) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict[str, Any]]]:
+    alerts = []
+    if md_file is None:
+        return pd.DataFrame(), pd.DataFrame(), [{"tipo": "Predicción", "mensaje": "No se cargó MD actual; no se puede calcular costo por salario."}]
+    try:
+        df = read_any_upload(md_file)
+        df = drop_duplicated_columns(df)
+        c_sap = find_col(df, ["Nº pers.", "N° pers.", "SAP"], True)
+        c_status = find_col(df, ["Status ocupación", "Status ocupacion", "Status"], False)
+        c_baja = find_col(df, ["Baja"], False)
+        c_div = find_col(df, ["División de personal", "Division de personal"], False)
+        c_area_pers = find_col(df, ["Área de personal", "Area de personal"], False)
+        c_area_nom = find_col(df, ["Área de nómina", "Area de nomina", "Texto área nómina"], False)
+        c_ceco = find_col(df, ["Ce.coste", "CECO", "Ce coste"], False)
+        c_pos_code = find_col(df, ["Posición", "Posicion"], False)
+        c_pos_text = find_col(df, ["Posición.1", "Posicion.1", "Posición_3", "Posicion_3", "Posición                                ", "Posicion nombre", "Nombre posición"], False)
+        c_func_code = find_col(df, ["Función", "Funcion"], False)
+        c_func_text = find_col(df, ["Función.1", "Funcion.1", "Función_4", "Funcion_4", "Función                                 ", "Nombre función"], False)
+        c_concept = find_col(df, ["CC-nómina", "CC-nomina", "CC-nómina.1", "CC-n.", "CC-n"], True)
+        # Si encuentra texto de concepto en vez de código, reintentar por nombre exacto aproximado de código SAP
+        # En el TXT de SAP hay dos columnas CC-nómina: código y texto; find_col suele tomar la primera.
+        if c_concept and not df[c_concept].astype(str).str.upper().str.contains(r"Y\d{3}|Y\w\d", regex=True, na=False).any():
+            for c in df.columns:
+                if df[c].astype(str).str.upper().str.contains(r"Y\d{3}|YM01", regex=True, na=False).any():
+                    c_concept = c
+                    break
+        c_importe = find_col(df, ["Importe", "     Importe", "Valor"], True)
+        c_hsem = find_col(df, ["H sem.", "H sem", "Horas semanales", "Horas semana"], False)
+        c_desde = find_col(df, ["Desde"], False)
+        c_hasta = find_col(df, ["Hasta"], False)
+        c_modif = find_col(df, ["Modif.el", "Modif el", "Modificado el"], False)
+        out = pd.DataFrame()
+        out["sap"] = df[c_sap].apply(clean_sap)
+        out["status"] = df[c_status].apply(clean_text) if c_status else ""
+        out["baja"] = df[c_baja].apply(clean_text) if c_baja else ""
+        out["division"] = df[c_div].apply(clean_text) if c_div else ""
+        out["area_personal"] = df[c_area_pers].apply(clean_text) if c_area_pers else ""
+        out["area_nomina"] = df[c_area_nom].apply(clean_text) if c_area_nom else ""
+        out["ceco"] = df[c_ceco].apply(clean_code) if c_ceco else ""
+        out["posicion_codigo"] = df[c_pos_code].apply(clean_code) if c_pos_code else ""
+        out["posicion_nombre"] = df[c_pos_text].apply(clean_text) if c_pos_text else ""
+        out["funcion_codigo"] = df[c_func_code].apply(clean_code) if c_func_code else ""
+        out["funcion_nombre"] = df[c_func_text].apply(clean_text) if c_func_text else ""
+        out["concepto_salario"] = df[c_concept].apply(clean_concept)
+        out["importe"] = df[c_importe].apply(parse_number)
+        out["h_sem"] = df[c_hsem].apply(parse_number) if c_hsem else 0.0
+        out["desde"] = df[c_desde].apply(to_datetime_sap) if c_desde else pd.NaT
+        out["hasta"] = df[c_hasta].apply(to_datetime_sap) if c_hasta else pd.NaT
+        out["modif_el"] = df[c_modif].apply(to_datetime_sap) if c_modif else pd.NaT
+        out = out[out["sap"].ne("")].copy()
+        out = out[out["concepto_salario"].isin(CONCEPTOS_SALARIALES)].copy()
+        if out.empty:
+            return pd.DataFrame(), pd.DataFrame(), [{"tipo": "Predicción", "mensaje": "MD actual sin conceptos salariales reconocidos para calcular salario total."}]
+        # Vigencia objetivo por persona: 31.12.9999 si existe; si no, fecha máxima de Hasta.
+        far_date = pd.Timestamp(year=9999, month=12, day=31)
+        # Pandas no soporta year 9999 en datetime64 ns, por eso la fecha SAP 31.12.9999 puede quedar NaT. Detectar por texto original en df si aplica.
+        if c_hasta:
+            out["hasta_txt"] = df.loc[out.index, c_hasta].astype(str).str.strip()
+            out["es_vigente_abierta"] = out["hasta_txt"].str.contains("31.12.9999|9999", regex=True, na=False)
+        else:
+            out["hasta_txt"] = ""
+            out["es_vigente_abierta"] = False
+        vig_rows = []
+        for sap, g in out.groupby("sap"):
+            if g["es_vigente_abierta"].any():
+                target = "ABIERTA"
+                gg = g[g["es_vigente_abierta"]].copy()
+            else:
+                max_hasta = g["hasta"].max()
+                target = max_hasta
+                gg = g[g["hasta"].eq(max_hasta)].copy() if pd.notna(max_hasta) else g.copy()
+            gg["vigencia_usada"] = str(target)
+            vig_rows.append(gg)
+        vig = pd.concat(vig_rows, ignore_index=True) if vig_rows else pd.DataFrame()
+        if vig.empty:
+            return pd.DataFrame(), pd.DataFrame(), alerts
+        vig["modif_ord"] = vig["modif_el"].fillna(pd.Timestamp("1900-01-01"))
+        vig = vig.sort_values(["sap", "concepto_salario", "modif_ord", "importe"], ascending=[True, True, False, False])
+        det = vig.drop_duplicates(["sap", "concepto_salario"], keep="first").copy()
+        # datos dimensionales: tomar registro más reciente dentro de vigencia por persona
+        dim = det.sort_values(["sap", "modif_ord"], ascending=[True, False]).drop_duplicates("sap", keep="first").copy()
+        sal = det.groupby("sap", dropna=False).agg(
+            salario_base=("importe", lambda s: float(det.loc[s.index][det.loc[s.index, "concepto_salario"].isin(CONCEPTOS_SALARIO_BASE)]["importe"].sum())),
+            bonos_sumados=("importe", lambda s: float(det.loc[s.index][det.loc[s.index, "concepto_salario"].isin(CONCEPTOS_BONOS)]["importe"].sum())),
+        ).reset_index()
+        sal["salario_total"] = sal["salario_base"] + sal["bonos_sumados"]
+        dim_cols = ["sap", "division", "area_personal", "area_nomina", "ceco", "posicion_codigo", "posicion_nombre", "funcion_codigo", "funcion_nombre", "h_sem", "vigencia_usada"]
+        md = sal.merge(dim[dim_cols], on="sap", how="left")
+        md["jornada_vigente"] = np.where(md["h_sem"].fillna(0) > 0, md["h_sem"].astype(float) * 5, float(default_jornada))
+        md["jornada_vigente"] = md["jornada_vigente"].replace(0, float(default_jornada)).fillna(float(default_jornada))
+        md["valor_hora"] = np.where(md["jornada_vigente"] > 0, md["salario_total"] / md["jornada_vigente"], 0)
+        md["area_negocio"] = [classify_area(ceco, div, "", an, pos) for ceco, div, an, pos in zip(md["ceco"], md["division"], md["area_nomina"], md["posicion_nombre"])]
+        md["manager_excluido"] = [is_manager_excl(ap, an, pos) for ap, an, pos in zip(md["area_personal"], md["area_nomina"], md["posicion_nombre"])]
+        # Homologar por función; si no hay función, usar maestro Posición -> Función
+        tmp = pd.DataFrame({
+            "sap": md["sap"],
+            "periodo_novedad": "",
+            "posicion_original": md["posicion_nombre"],
+            "funcion_codigo": md["funcion_codigo"],
+            "funcion_nombre": md["funcion_nombre"],
+            "area_negocio": md["area_negocio"],
+        })
+        tmp_alerts = []
+        tmp = add_function_and_cargo(tmp, "MD actual", master, func_map, pd.DataFrame(), tmp_alerts, prefer_sap=False)
+        md["funcion_codigo_final"] = tmp["funcion_codigo_final"].values
+        md["funcion_nombre_final"] = tmp["funcion_nombre_final"].values
+        md["cargo_homologado"] = tmp["cargo_homologado"].values
+        md["metodo_cargo"] = tmp["metodo_cargo"].values
+        alerts.append({"tipo": "Predicción", "mensaje": f"MD actual: {len(md):,} personas con salario total calculado."})
+        sin_salario = md[md["salario_total"].fillna(0) <= 0]
+        if len(sin_salario):
+            alerts.append({"tipo": "Predicción", "mensaje": f"MD actual: {len(sin_salario):,} personas sin salario total o en cero."})
+        return md, det, alerts
+    except Exception as e:
+        return pd.DataFrame(), pd.DataFrame(), [{"tipo": "Error", "mensaje": f"Error procesando MD actual: {e}"}]
+
+
+def process_interfaces(interface_files: List[Any], concept_map: Dict[str, str], func_map: Dict[str, str], master: Dict[str, Dict[str, str]], hc_full: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[Dict[str, Any]]]:
+    rows = []
+    alerts = []
+    for f in interface_files or []:
+        try:
+            df = read_any_upload(f)
+            df = drop_duplicated_columns(df)
+            # Si no reconoce encabezados, usar primeras 4 columnas: SAP, periodo/fecha pago, concepto, cantidad.
+            c_sap = find_col(df, ["SAP", "Nº pers.", "N° pers.", "Nro Personal", "Número de personal"], False)
+            c_period = find_col(df, ["Periodo", "Mes", "Fecha", "Fecha pago", "Mes pago"], False)
+            c_concept = find_col(df, ["Concepto", "CC-n.", "CC-n", "Concepto nómina", "Concepto nomina"], False)
+            c_qty = find_col(df, ["Cantidad", "Horas", "Total"], False)
+            c_ceco = find_col(df, ["CECO", "Ce.coste", "Ce coste"], False)
+            c_func = find_col(df, ["Función", "Funcion", "Cargo", "Posición", "Posicion"], False)
+            if not all([c_sap, c_concept, c_qty]) and len(df.columns) >= 4:
+                cols = list(df.columns)
+                c_sap = c_sap or cols[0]
+                c_period = c_period or cols[1]
+                c_concept = c_concept or cols[2]
+                c_qty = c_qty or cols[3]
+            out = pd.DataFrame()
+            out["fuente"] = "Interface"
+            out["archivo"] = f.name
+            out["sap"] = df[c_sap].apply(clean_sap) if c_sap else ""
+            out["periodo_pago"] = df[c_period].apply(lambda x: parse_period_any(x, f.name)) if c_period else parse_period_any("", f.name)
+            out["periodo_novedad"] = out["periodo_pago"].apply(prev_period)
+            out["concepto_interface"] = df[c_concept].apply(clean_concept) if c_concept else ""
+            out["concepto"] = out["concepto_interface"].map(lambda x: INTERFAZ_MAP.get(x, x))
+            out["tipo_hora"] = out["concepto"].map(concept_map).fillna(out["concepto"].map(CONCEPTOS)).fillna("Sin tipo hora")
+            out["cantidad_interface"] = df[c_qty].apply(parse_number) if c_qty else 0.0
+            out["ceco"] = df[c_ceco].apply(clean_code) if c_ceco else ""
+            func_txt = df[c_func].apply(clean_text) if c_func else pd.Series([""] * len(df))
+            out["posicion_original"] = func_txt
+            out["funcion_codigo"] = ""
+            out["funcion_nombre"] = func_txt
+            out["area_negocio"] = [classify_area(ceco, "", "", "", pos) for ceco, pos in zip(out["ceco"], func_txt)]
+            out = out[out["concepto"].isin(CONCEPTOS_SET)].copy()
+            out = out[out["cantidad_interface"].abs() > 0].copy()
+            invalid = out["sap"].eq("").sum()
+            if invalid:
+                alerts.append({"tipo": "Interface", "mensaje": f"{f.name}: {invalid:,} registros sin SAP válido; se intentará homologar por función/cargo."})
+            out = add_function_and_cargo(out, "Interface", master, func_map, hc_full, alerts, prefer_sap=True)
+            rows.append(out)
+            alerts.append({"tipo": "Cargue", "mensaje": f"Interface {f.name}: {len(out):,} registros útiles procesados"})
+        except Exception as e:
+            alerts.append({"tipo": "Error", "mensaje": f"Error procesando interface {getattr(f, 'name', 'archivo')}: {e}"})
+    full = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if full.empty:
+        return full, pd.DataFrame(), alerts
+    agg = full.groupby(KEY_EXEC, dropna=False).agg(cantidad_interface=("cantidad_interface", "sum")).reset_index()
+    agg = ensure_key_types(agg, KEY_EXEC)
+    return full, agg, alerts
+
+
+def read_cuentas(cuenta_file) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    alerts = []
+    if cuenta_file is None:
+        return pd.DataFrame(), alerts
+    try:
+        df = read_any_upload(cuenta_file)
+        df = drop_duplicated_columns(df)
+        c_con = find_col(df, ["Concepto", "CC-n.", "CC-n"], False)
+        c_area = find_col(df, ["Área negocio", "Area negocio", "Area", "Tipo"], False)
+        c_ceco_pref = find_col(df, ["CECO inicio", "Prefijo CECO", "CECO", "Ceco"], False)
+        c_cuenta = find_col(df, ["Cuenta", "Cuenta contable", "DKON"], True)
+        c_desc = find_col(df, ["Descripción", "Descripcion", "Texto cuenta"], False)
+        out = pd.DataFrame()
+        out["concepto"] = df[c_con].apply(clean_concept) if c_con else ""
+        out["area_negocio"] = df[c_area].apply(clean_text) if c_area else ""
+        out["ceco_prefijo"] = df[c_ceco_pref].apply(clean_code) if c_ceco_pref else ""
+        out["cuenta"] = df[c_cuenta].apply(clean_code)
+        out["descripcion_cuenta"] = df[c_desc].apply(clean_text) if c_desc else ""
+        out = out[out["cuenta"].ne("")].copy()
+        alerts.append({"tipo": "Predicción", "mensaje": f"Cuentas: {len(out):,} reglas cargadas."})
+        return out, alerts
+    except Exception as e:
+        return pd.DataFrame(), [{"tipo": "Error", "mensaje": f"Error leyendo cuentas: {e}"}]
+
+
+def assign_account(df: pd.DataFrame, cuentas: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["cuenta"] = ""
+    out["descripcion_cuenta"] = ""
+    if cuentas is not None and not cuentas.empty:
+        # prioridad: concepto+área; concepto+prefijo; área; prefijo; concepto
+        rules = cuentas.copy()
+        rules["concepto"] = rules["concepto"].fillna("").astype(str)
+        rules["area_negocio"] = rules["area_negocio"].fillna("").astype(str)
+        rules["ceco_prefijo"] = rules["ceco_prefijo"].fillna("").astype(str)
+        for idx in out.index:
+            concepto = str(out.at[idx, "concepto"])
+            area = str(out.at[idx, "area_negocio"])
+            ceco = str(out.at[idx, "ceco"] if "ceco" in out.columns else "")
+            candidates = rules.copy()
+            def ok_rule(r):
+                if r["concepto"] and r["concepto"] != concepto:
+                    return False
+                if r["area_negocio"] and r["area_negocio"] != area:
+                    return False
+                if r["ceco_prefijo"] and not ceco.startswith(r["ceco_prefijo"]):
+                    return False
+                return True
+            m = candidates[candidates.apply(ok_rule, axis=1)]
+            if not m.empty:
+                # más específica = más campos llenos
+                m = m.assign(spec=m[["concepto", "area_negocio", "ceco_prefijo"]].ne("").sum(axis=1)).sort_values("spec", ascending=False)
+                out.at[idx, "cuenta"] = m.iloc[0]["cuenta"]
+                out.at[idx, "descripcion_cuenta"] = m.iloc[0].get("descripcion_cuenta", "")
+    # fallback por CECO / área según Modelo Financiero Nómina
+    if "ceco" not in out.columns:
+        out["ceco"] = ""
+    empty = out["cuenta"].eq("")
+    out.loc[empty & out["ceco"].astype(str).str.startswith("101"), "cuenta"] = "60"
+    out.loc[empty & out["ceco"].astype(str).str.startswith("102"), "cuenta"] = "62"
+    out.loc[empty & out["ceco"].astype(str).str.startswith("103"), "cuenta"] = "63"
+    empty = out["cuenta"].eq("")
+    out.loc[empty & out["area_negocio"].eq("Tiendas"), "cuenta"] = "60"
+    out.loc[empty & out["area_negocio"].isin(["CEDI", "BDC"]), "cuenta"] = "62"
+    out.loc[empty & out["area_negocio"].eq("Oficina Soporte"), "cuenta"] = "63"
+    out.loc[out["descripcion_cuenta"].eq("") & out["cuenta"].eq("60"), "descripcion_cuenta"] = "Tiendas"
+    out.loc[out["descripcion_cuenta"].eq("") & out["cuenta"].eq("62"), "descripcion_cuenta"] = "Logística / BDC / CEDI"
+    out.loc[out["descripcion_cuenta"].eq("") & out["cuenta"].eq("63"), "descripcion_cuenta"] = "Administración / Oficina soporte"
+    return out
+
+
+def calendar_factor_for_concept(concepto: str, dias_mes: int, domingos: int, festivos: int, factor_manual: float) -> float:
+    # El factor manual permite ajustar por calendario sin sobrecomplejizar. Se aplica a todos.
+    # Los recargos dominicales/festivos quedan más sensibles si el usuario cambia factor_manual.
+    return float(factor_manual)
+
+
+def weighted_rate_from_history(report_exec: pd.DataFrame, months: List[str], weights: List[float]) -> pd.DataFrame:
+    if report_exec is None or report_exec.empty:
+        return pd.DataFrame(columns=KEY_EXEC + ["tasa_hist_horas_hc", "valor_hist_por_hora"])
+    hist = report_exec[report_exec["periodo_novedad"].astype(str).isin(months)].copy()
+    if hist.empty:
+        return pd.DataFrame(columns=KEY_EXEC + ["tasa_hist_horas_hc", "valor_hist_por_hora"])
+    wmap = {m: weights[i] if i < len(weights) else 0 for i, m in enumerate(months)}
+    hist["peso"] = hist["periodo_novedad"].map(wmap).fillna(0).astype(float)
+    hist["tasa_mes"] = np.where(hist["hc"].fillna(0) > 0, hist["cantidad_pagada"].fillna(0) / hist["hc"].fillna(0), 0)
+    hist["valor_hora_pagado_real"] = np.where(hist["cantidad_pagada"].abs() > 0, hist["valor_pagado"] / hist["cantidad_pagada"], 0)
+    gcols = [c for c in KEY_EXEC if c in hist.columns]
+    out = hist.groupby(gcols, dropna=False).apply(lambda g: pd.Series({
+        "tasa_hist_horas_hc": float(np.average(g["tasa_mes"], weights=np.where(g["peso"]>0, g["peso"], 0.0001))) if len(g) else 0,
+        "valor_hist_por_hora": float(np.average(g["valor_hora_pagado_real"], weights=np.where(g["cantidad_pagada"].abs()>0, g["cantidad_pagada"].abs(), 0.0001))) if len(g) else 0,
+    })).reset_index()
+    return out
+
+
+def build_prediction(res: Dict[str, Any], interface_files: List[Any], md_file, cuenta_file, periodo_prediccion: str, default_jornada: float, factores_df: pd.DataFrame, pesos: Dict[str, float], factor_cal: float, dias_mes: int, domingos: int, festivos: int) -> Dict[str, pd.DataFrame]:
+    alerts = []
+    report = res.get("report", {}) if res else {}
+    raw = res.get("raw", {}) if res else {}
+    extras = res.get("extras", {}) if res else {}
+    # mapas desde procesamiento histórico
+    # Releer Detalle/maestro no está disponible como dict; se puede reconstruir mínimo desde extras + raw.
+    # Para robustez, usar el func_map/final ya embebido en master no es posible aquí, por eso guardaremos en res desde process_all_v11.
+    func_map = res.get("func_map", {})
+    concept_map = res.get("concept_map", dict(CONCEPTOS))
+    master = res.get("master", {})
+    hc_full = raw.get("headcount", pd.DataFrame())
+    interfaz_full, interfaz_agg, a = process_interfaces(interface_files, concept_map, func_map, master, hc_full)
+    alerts.extend(a)
+    md, md_detalle_salario, a = read_md_actual(md_file, default_jornada, concept_map, func_map, master)
+    alerts.extend(a)
+    cuentas, a = read_cuentas(cuenta_file)
+    alerts.extend(a)
+    if factores_df is None or factores_df.empty:
+        factores_df = DEFAULT_FACTORES.copy()
+    factores_df = factores_df.copy()
+    factores_df["concepto"] = factores_df["concepto"].apply(clean_concept)
+    factores_df["factor_concepto"] = factores_df["factor_concepto"].apply(parse_number)
+    prev_pred = prev_period(periodo_prediccion)
+    # Históricos usados: tres meses inmediatamente anteriores al mes previo disponible
+    hist_months = []
+    p = prev_pred
+    for _ in range(3):
+        if p:
+            hist_months.append(p)
+            p = prev_period(p)
+    # Pesos de meses: más reciente primero
+    hist_weights = [0.50, 0.30, 0.20]
+    exec_df = report.get("Resumen_Ejecutivo", pd.DataFrame()).copy()
+    hist_rate = weighted_rate_from_history(exec_df, hist_months, hist_weights)
+    # Tasa interface del mes inmediatamente anterior: interface del pago actual corresponde al mes anterior laborado.
+    if interfaz_agg is not None and not interfaz_agg.empty:
+        int_prev = interfaz_agg[interfaz_agg["periodo_novedad"].eq(prev_pred)].copy()
+    else:
+        int_prev = pd.DataFrame(columns=KEY_EXEC + ["cantidad_interface"])
+    hc_hist = report.get("Resumen_Cargo_Homologado", pd.DataFrame())
+    if hc_hist is not None and not hc_hist.empty and not int_prev.empty:
+        hc_prev = hc_hist[hc_hist["periodo_novedad"].eq(prev_pred)][KEY_HC + ["hc"]].drop_duplicates(KEY_HC)
+        int_prev = int_prev.merge(hc_prev, on=KEY_HC, how="left")
+        int_prev["hc"] = int_prev["hc"].fillna(0)
+        int_prev["tasa_interface_horas_hc"] = np.where(int_prev["hc"] > 0, int_prev["cantidad_interface"] / int_prev["hc"], 0)
+    else:
+        int_prev["tasa_interface_horas_hc"] = 0.0
+    # Proyección y provisión del mes a predecir como señales
+    curr_exec = exec_df[exec_df["periodo_novedad"].eq(periodo_prediccion)].copy() if exec_df is not None and not exec_df.empty else pd.DataFrame()
+    if not curr_exec.empty:
+        curr_exec["tasa_proy_horas_hc"] = np.where(curr_exec["hc"].fillna(0) > 0, curr_exec["cantidad_proyectada"].fillna(0) / curr_exec["hc"].fillna(0), 0)
+        curr_exec["tasa_prov_horas_hc"] = np.where(curr_exec["hc"].fillna(0) > 0, curr_exec["cantidad_provisionada"].fillna(0) / curr_exec["hc"].fillna(0), 0)
+        curr_signal = curr_exec[KEY_EXEC + ["cantidad_proyectada", "valor_proyectado", "cantidad_provisionada", "valor_provisionado", "tasa_proy_horas_hc", "tasa_prov_horas_hc"]].copy()
+    else:
+        curr_signal = pd.DataFrame(columns=KEY_EXEC + ["cantidad_proyectada", "valor_proyectado", "cantidad_provisionada", "valor_provisionado", "tasa_proy_horas_hc", "tasa_prov_horas_hc"])
+    # Universo de combinaciones
+    frames = []
+    for df in [hist_rate, int_prev, curr_signal]:
+        if df is not None and not df.empty:
+            frames.append(df[KEY_EXEC].drop_duplicates())
+    if frames:
+        universe = pd.concat(frames, ignore_index=True).drop_duplicates()
+    else:
+        universe = pd.DataFrame(columns=KEY_EXEC)
+    # HC actual desde MD actual, excluyendo Managers
+    if md is not None and not md.empty:
+        md_valid = md[~md["manager_excluido"].fillna(False)].copy()
+        hc_actual = md_valid.groupby(["area_negocio", "cargo_homologado"], dropna=False).agg(
+            hc_actual=("sap", "nunique"),
+            valor_hora_prom=("valor_hora", "mean"),
+            salario_total_prom=("salario_total", "mean"),
+        ).reset_index()
+    else:
+        # fallback: HC del período desde comparativo si existe
+        hc_fallback = hc_hist[hc_hist["periodo_novedad"].eq(periodo_prediccion)][KEY_HC + ["hc"]].copy() if hc_hist is not None and not hc_hist.empty else pd.DataFrame(columns=KEY_HC + ["hc"])
+        hc_actual = hc_fallback.rename(columns={"hc": "hc_actual"})[["area_negocio", "cargo_homologado", "hc_actual"]].copy()
+        hc_actual["valor_hora_prom"] = 0.0
+        hc_actual["salario_total_prom"] = 0.0
+    pred = universe.merge(hist_rate, on=KEY_EXEC, how="left")
+    pred = pred.merge(int_prev[KEY_EXEC + ["cantidad_interface", "tasa_interface_horas_hc"]] if not int_prev.empty else pd.DataFrame(columns=KEY_EXEC + ["cantidad_interface", "tasa_interface_horas_hc"]), on=KEY_EXEC, how="left")
+    pred = pred.merge(curr_signal, on=KEY_EXEC, how="left")
+    pred = pred.merge(hc_actual, on=["area_negocio", "cargo_homologado"], how="left")
+    pred = pred.merge(factores_df[["concepto", "factor_concepto"]], on="concepto", how="left")
+    for c in ["tasa_hist_horas_hc", "tasa_interface_horas_hc", "tasa_proy_horas_hc", "tasa_prov_horas_hc", "cantidad_interface", "cantidad_proyectada", "valor_proyectado", "cantidad_provisionada", "valor_provisionado", "hc_actual", "valor_hora_prom", "factor_concepto"]:
+        if c not in pred.columns:
+            pred[c] = 0.0
+        pred[c] = pred[c].fillna(0.0).astype(float)
+    pred["factor_concepto"] = pred["factor_concepto"].replace(0, 1.0)
+    wi = float(pesos.get("interface", 0.40)); wh = float(pesos.get("historico", 0.30)); wp = float(pesos.get("proyeccion", 0.20)); wv = float(pesos.get("provision", 0.10))
+    total_w = max(wi + wh + wp + wv, 0.0001)
+    pred["tasa_estimada_horas_hc"] = (
+        pred["tasa_interface_horas_hc"] * wi +
+        pred["tasa_hist_horas_hc"] * wh +
+        pred["tasa_proy_horas_hc"] * wp +
+        pred["tasa_prov_horas_hc"] * wv
+    ) / total_w
+    pred["factor_calendario"] = [calendar_factor_for_concept(c, dias_mes, domingos, festivos, factor_cal) for c in pred["concepto"]]
+    pred["cantidad_estimada"] = pred["tasa_estimada_horas_hc"] * pred["hc_actual"] * pred["factor_calendario"]
+    pred["valor_estimado"] = pred["cantidad_estimada"] * pred["valor_hora_prom"] * pred["factor_concepto"]
+    pred["dif_estimado_vs_proyeccion"] = pred["valor_estimado"] - pred["valor_proyectado"]
+    pred["dif_estimado_vs_provision"] = pred["valor_estimado"] - pred["valor_provisionado"]
+    pred["periodo_prediccion"] = periodo_prediccion
+    pred["periodo_pago_estimado"] = next_period(periodo_prediccion)
+    pred["dias_mes"] = dias_mes
+    pred["domingos"] = domingos
+    pred["festivos"] = festivos
+    # CECO para cuenta: no está en ejecutivo, usar vacío y fallback por área. Si quiere cuenta por CECO, se debería predecir en detalle.
+    pred["ceco"] = ""
+    pred = assign_account(pred, cuentas)
+    pred_sin_ceros = pred[(pred["cantidad_estimada"].abs() + pred["valor_estimado"].abs() + pred["valor_proyectado"].abs() + pred["valor_provisionado"].abs()) > 0].copy()
+    resumen_cuentas = pred_sin_ceros.groupby(["periodo_prediccion", "periodo_pago_estimado", "cuenta", "descripcion_cuenta", "area_negocio", "concepto", "tipo_hora"], dropna=False).agg(
+        cantidad_estimada=("cantidad_estimada", "sum"),
+        valor_estimado=("valor_estimado", "sum"),
+        valor_proyectado=("valor_proyectado", "sum"),
+        valor_provisionado=("valor_provisionado", "sum"),
+    ).reset_index()
+    resumen_area_cargo = pred_sin_ceros.groupby(["periodo_prediccion", "area_negocio", "cargo_homologado"], dropna=False).agg(
+        hc_actual=("hc_actual", "max"),
+        cantidad_estimada=("cantidad_estimada", "sum"),
+        valor_estimado=("valor_estimado", "sum"),
+        valor_proyectado=("valor_proyectado", "sum"),
+        valor_provisionado=("valor_provisionado", "sum"),
+    ).reset_index()
+    # alertas predicción
+    if interfaz_full.empty:
+        alerts.append({"tipo": "Predicción", "mensaje": "No se cargaron interfaces; la predicción usará histórico/proyección/provisión."})
+    if md is None or md.empty:
+        alerts.append({"tipo": "Predicción", "mensaje": "No hay MD actual; el costo puede quedar en cero por falta de valor hora."})
+    sin_hc = pred_sin_ceros[pred_sin_ceros["hc_actual"].fillna(0) == 0]
+    if len(sin_hc):
+        alerts.append({"tipo": "Predicción", "mensaje": f"{len(sin_hc):,} combinaciones de predicción quedaron con HC actual en cero."})
+    sin_cuenta = pred_sin_ceros[pred_sin_ceros["cuenta"].fillna("").eq("")]
+    if len(sin_cuenta):
+        alerts.append({"tipo": "Predicción", "mensaje": f"{len(sin_cuenta):,} combinaciones de predicción sin cuenta asignada."})
+    return {
+        "Prediccion_Detalle": pred_sin_ceros,
+        "Prediccion_Resumen_Cuenta": resumen_cuentas,
+        "Prediccion_Area_Cargo": resumen_area_cargo,
+        "Interfaces_Procesadas": interfaz_full,
+        "MD_Valor_Hora": md if md is not None else pd.DataFrame(),
+        "MD_Detalle_Salario": md_detalle_salario if md_detalle_salario is not None else pd.DataFrame(),
+        "Factores_Usados": factores_df,
+        "Cuentas_Usadas": cuentas if cuentas is not None else pd.DataFrame(),
+        "Alertas_Prediccion": pd.DataFrame(alerts),
+    }
+
+
+def make_prediction_excel(pred: Dict[str, pd.DataFrame]) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        wb = writer.book
+        fmt_header = wb.add_format({"bold": True, "bg_color": ORANGE, "font_color": "white", "border": 1})
+        fmt_money = wb.add_format({"num_format": '$ #,##0', "border": 1})
+        fmt_qty = wb.add_format({"num_format": '#,##0.00', "border": 1})
+        fmt_text = wb.add_format({"border": 1})
+        for sheet, df in pred.items():
+            if df is None or df.empty:
+                df = pd.DataFrame({"Mensaje": ["Sin datos"]})
+            sheet_name = re.sub(r"[\[\]\:\*\?\/\\]", "_", sheet)[:31]
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
+            ws = writer.sheets[sheet_name]
+            for i, col in enumerate(df.columns):
+                ws.write(0, i, col, fmt_header)
+                lc = str(col).lower()
+                width = min(max(12, len(str(col)) + 2), 34)
+                if any(t in lc for t in ["valor", "costo", "salario"]):
+                    ws.set_column(i, i, max(width, 16), fmt_money)
+                elif any(t in lc for t in ["cantidad", "horas", "tasa", "factor"]):
+                    ws.set_column(i, i, max(width, 14), fmt_qty)
+                else:
+                    ws.set_column(i, i, width, fmt_text)
+            ws.autofilter(0, 0, max(len(df), 1), max(len(df.columns)-1, 0))
+            ws.freeze_panes(1, 0)
+    return output.getvalue()
+
+
+# Enriquecer process_all para guardar mapas de homologación en sesión
+def process_all_v11(inputs: Dict[str, List[Any]], umbral: float = 15.0) -> Dict[str, Any]:
+    res = process_all(inputs, umbral=umbral)
+    # Reconstruir mapas para predicción desde los mismos insumos
+    detalle_file = inputs.get("detalle", [None])[0] if inputs.get("detalle") else None
+    concept_map, func_map, _ = read_detalle_horas(detalle_file)
+    hc_full = res.get("raw", {}).get("headcount", pd.DataFrame())
+    poshom_df = None
+    if inputs.get("posiciones"):
+        try:
+            try:
+                poshom_df = read_excel_upload(inputs["posiciones"][0], sheet_name="HEAD_COUNT")
+            except Exception:
+                poshom_df = read_any_upload(inputs["posiciones"][0])
+        except Exception:
+            poshom_df = None
+    master, _ = build_position_function_master(hc_full, poshom_df)
+    res["concept_map"] = concept_map
+    res["func_map"] = func_map
+    res["master"] = master
+    return res
+
+# ==============================
+# UI - V11
+# ==============================
+if "resultado_v11" not in st.session_state:
+    st.session_state["resultado_v11"] = None
+if "prediccion_v11" not in st.session_state:
+    st.session_state["prediccion_v11"] = None
 
 with st.sidebar:
     st.image("https://upload.wikimedia.org/wikipedia/commons/thumb/9/9b/Ara_macao_-Costa_Rica-8.jpg/320px-Ara_macao_-Costa_Rica-8.jpg", width=110)
     st.markdown("### Menú")
-    page = st.radio("Ir a", ["1. Cargue y procesamiento", "2. Comparativo histórico", "3. Diagnóstico y alertas", "4. Instructivo"], label_visibility="collapsed")
+    page = st.radio(
+        "Ir a",
+        ["1. Cargue y procesamiento", "2. Comparativo histórico", "3. Predicción mes en curso", "4. Diagnóstico y alertas", "5. Instructivo"],
+        label_visibility="collapsed",
+    )
     st.divider()
     umbral = st.number_input("Umbral desviación alerta (%)", min_value=1.0, max_value=100.0, value=15.0, step=1.0)
 
 if page == "1. Cargue y procesamiento":
     st.subheader("1. Cargue de archivos")
-    st.markdown("Carga cada bloque por separado. El comparativo se calcula por **mes de novedad**; CCNómina y compensatorios se corren un mes atrás por pago mes vencido.")
+    st.markdown("Carga cada bloque por separado. Primero se construye el comparativo histórico; después se usa como base para la predicción financiera.")
     c1, c2 = st.columns(2)
     with c1:
         detalle = st.file_uploader("Detalle Horas / Homologación (obligatorio)", type=["xlsb", "xlsx", "xlsm"], accept_multiple_files=False)
@@ -1207,8 +1753,8 @@ if page == "1. Cargue y procesamiento":
         headcount = st.file_uploader("Headcount mensual (cargue múltiple)", type=["xlsx", "xlsm", "xls"], accept_multiple_files=True)
         provision = st.file_uploader("Consolidado Provisión", type=["xlsx", "xlsm"], accept_multiple_files=True)
         proyeccion = st.file_uploader("Consolidado Proyección", type=["xlsx", "xlsm"], accept_multiple_files=True)
-    st.info("Tip: Posiciones homologadas es opcional. Si no se carga, la app construye el maestro Posición → Función desde los Headcount cargados.")
-    if st.button("🚀 Procesar archivos", type="primary", use_container_width=True):
+    st.info("La predicción se habilita después de procesar el comparativo. Posiciones homologadas es opcional: si no se carga, se arma desde los Headcount.")
+    if st.button("🚀 Procesar comparativo", type="primary", use_container_width=True):
         if not detalle:
             st.error("Debes cargar Detalle Horas / Homologación.")
         elif not headcount:
@@ -1224,12 +1770,13 @@ if page == "1. Cargue y procesamiento":
                 "proyeccion": proyeccion or [],
             }
             try:
-                st.session_state["resultado_v10"] = process_all(inputs, umbral=umbral)
-                st.success("Procesamiento finalizado. Ve a Comparativo histórico para revisar resultados.")
+                st.session_state["resultado_v11"] = process_all_v11(inputs, umbral=umbral)
+                st.session_state["prediccion_v11"] = None
+                st.success("Comparativo procesado. Revisa resultados o pasa al módulo de predicción.")
             except Exception as e:
                 st.exception(e)
-    if st.session_state["resultado_v10"]:
-        m = st.session_state["resultado_v10"]["metrics"]
+    if st.session_state["resultado_v11"]:
+        m = st.session_state["resultado_v11"]["metrics"]
         st.subheader("Control de registros procesados")
         cols = st.columns(5)
         cols[0].metric("Pagado", format_int(m.get("pagado_registros",0)))
@@ -1240,12 +1787,12 @@ if page == "1. Cargue y procesamiento":
 
 elif page == "2. Comparativo histórico":
     st.subheader("2. Comparativo histórico")
-    res = st.session_state.get("resultado_v10")
+    res = st.session_state.get("resultado_v11")
     if not res:
         st.warning("Primero procesa los archivos en la pantalla de cargue.")
     else:
         report = res["report"]
-        resumen_mes = report["Resumen_Mes"]
+        resumen_mes = report.get("Resumen_Mes", pd.DataFrame())
         total_pagado = resumen_mes["valor_pagado"].sum() if not resumen_mes.empty else 0
         total_prov = resumen_mes["valor_provisionado"].sum() if not resumen_mes.empty else 0
         total_proy = resumen_mes["valor_proyectado"].sum() if not resumen_mes.empty else 0
@@ -1254,7 +1801,7 @@ elif page == "2. Comparativo histórico":
         cols[1].metric("Provisión", format_money(total_prov))
         cols[2].metric("Proyección", format_money(total_proy))
         cols[3].metric("Dif. pagado vs provisión", format_money(total_pagado-total_prov))
-        base = report["Resumen_Ejecutivo_Sin_Ceros"].copy()
+        base = report.get("Resumen_Ejecutivo_Sin_Ceros", pd.DataFrame()).copy()
         with st.form("filtros_comparativo"):
             st.markdown("#### Filtros — vacío = todos")
             fcols = st.columns(5)
@@ -1268,21 +1815,96 @@ elif page == "2. Comparativo histórico":
             sel_cargos = fcols[2].multiselect("Cargo homologado", cargos, default=[])
             sel_conceptos = fcols[3].multiselect("Concepto", conceptos, default=[])
             sel_tipos = fcols[4].multiselect("Tipo hora", tipos, default=[])
-            submitted = st.form_submit_button("Aplicar filtros", type="primary")
+            st.form_submit_button("Aplicar filtros", type="primary")
         filters = {"periodo_novedad": sel_meses, "area_negocio": sel_areas, "cargo_homologado": sel_cargos, "concepto": sel_conceptos, "tipo_hora": sel_tipos}
-        filtered_exec = filter_df(report["Resumen_Ejecutivo_Sin_Ceros"], filters)
+        filtered_exec = filter_df(report.get("Resumen_Ejecutivo_Sin_Ceros", pd.DataFrame()), filters)
         st.markdown("### Resumen Ejecutivo sin ceros")
         display_df(filtered_exec)
         st.markdown("### Resumen por mes")
-        display_df(filter_df(report["Resumen_Mes"], {"periodo_novedad": sel_meses}))
+        display_df(filter_df(report.get("Resumen_Mes", pd.DataFrame()), {"periodo_novedad": sel_meses}))
         st.markdown("### Resumen por cargo homologado")
-        display_df(filter_df(report["Resumen_Cargo_Homologado"], {"periodo_novedad": sel_meses, "area_negocio": sel_areas, "cargo_homologado": sel_cargos}))
+        display_df(filter_df(report.get("Resumen_Cargo_Homologado", pd.DataFrame()), {"periodo_novedad": sel_meses, "area_negocio": sel_areas, "cargo_homologado": sel_cargos}))
         excel_bytes = make_excel(report, res["extras"])
-        st.download_button("📥 Descargar Excel completo", excel_bytes, file_name=f"comparativo_horas_nomina_{datetime.now():%Y%m%d_%H%M}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        st.download_button("📥 Descargar Excel comparativo", excel_bytes, file_name=f"comparativo_horas_nomina_{datetime.now():%Y%m%d_%H%M}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
 
-elif page == "3. Diagnóstico y alertas":
-    st.subheader("3. Diagnóstico y alertas")
-    res = st.session_state.get("resultado_v10")
+elif page == "3. Predicción mes en curso":
+    st.subheader("3. Predicción mes en curso")
+    res = st.session_state.get("resultado_v11")
+    if not res:
+        st.warning("Primero procesa el comparativo histórico. La predicción usa ese comparativo como base.")
+    else:
+        st.markdown("Esta pantalla estima el mes laborado actual, que se pagará el mes siguiente. Ejemplo: **junio laborado → pago julio**.")
+        with st.expander("Parámetros de predicción", expanded=True):
+            colp1, colp2, colp3, colp4 = st.columns(4)
+            available_months = sorted(res["report"].get("Resumen_Mes", pd.DataFrame()).get("periodo_novedad", pd.Series(dtype=str)).dropna().astype(str).unique(), key=period_sort_key)
+            suggested = next_period(available_months[-1]) if available_months else "06.2026"
+            periodo_pred = colp1.text_input("Mes a predecir (MM.AAAA)", value=suggested)
+            cal = suggest_calendar(periodo_pred)
+            dias_mes = colp2.number_input("Días del mes", min_value=1, max_value=31, value=int(cal["dias_mes"]), step=1)
+            domingos = colp3.number_input("Domingos", min_value=0, max_value=6, value=int(cal["domingos"]), step=1)
+            festivos = colp4.number_input("Festivos", min_value=0, max_value=10, value=int(cal["festivos"]), step=1)
+            colw1, colw2, colw3, colw4, colw5 = st.columns(5)
+            peso_interface = colw1.number_input("Peso interface", min_value=0.0, max_value=1.0, value=0.40, step=0.05)
+            peso_hist = colw2.number_input("Peso histórico", min_value=0.0, max_value=1.0, value=0.30, step=0.05)
+            peso_proy = colw3.number_input("Peso proyección", min_value=0.0, max_value=1.0, value=0.20, step=0.05)
+            peso_prov = colw4.number_input("Peso provisión", min_value=0.0, max_value=1.0, value=0.10, step=0.05)
+            factor_cal = colw5.number_input("Factor calendario", min_value=0.10, max_value=3.00, value=1.00, step=0.05)
+            jornada = st.number_input("Jornada vigente por defecto para valor hora", min_value=1.0, max_value=400.0, value=220.0, step=1.0)
+        c1, c2 = st.columns(2)
+        with c1:
+            interfaces = st.file_uploader("Interfaces regionales del mes (cargue múltiple)", type=["xlsx", "xlsm", "xls", "txt", "csv"], accept_multiple_files=True)
+            md_actual = st.file_uploader("MD actual TXT/Excel para salario y valor hora", type=["txt", "xlsx", "xlsm", "xls", "csv"], accept_multiple_files=False)
+        with c2:
+            cuentas_file = st.file_uploader("Tabla de cuentas contables (opcional)", type=["xlsx", "xlsm", "xls", "csv", "txt"], accept_multiple_files=False)
+            st.markdown("#### Factores por concepto")
+            factores_edit = st.data_editor(DEFAULT_FACTORES, use_container_width=True, num_rows="dynamic")
+        if st.button("📈 Generar predicción", type="primary", use_container_width=True):
+            try:
+                pesos = {"interface": peso_interface, "historico": peso_hist, "proyeccion": peso_proy, "provision": peso_prov}
+                pred = build_prediction(
+                    res,
+                    interfaces or [],
+                    md_actual,
+                    cuentas_file,
+                    periodo_pred,
+                    jornada,
+                    factores_edit,
+                    pesos,
+                    factor_cal,
+                    int(dias_mes),
+                    int(domingos),
+                    int(festivos),
+                )
+                st.session_state["prediccion_v11"] = pred
+                st.success("Predicción generada.")
+            except Exception as e:
+                st.exception(e)
+        pred = st.session_state.get("prediccion_v11")
+        if pred:
+            det = pred.get("Prediccion_Detalle", pd.DataFrame())
+            total_est = det["valor_estimado"].sum() if not det.empty and "valor_estimado" in det.columns else 0
+            total_qty = det["cantidad_estimada"].sum() if not det.empty and "cantidad_estimada" in det.columns else 0
+            cols = st.columns(4)
+            cols[0].metric("Cantidad estimada", format_qty(total_qty))
+            cols[1].metric("Valor estimado", format_money(total_est))
+            cols[2].metric("Pago estimado", next_period(periodo_pred))
+            cols[3].metric("Periodo laborado", periodo_pred)
+            tabs = st.tabs(["Predicción detalle", "Resumen por cuenta", "Área / cargo", "Alertas predicción", "MD valor hora"])
+            with tabs[0]:
+                display_df(pred.get("Prediccion_Detalle", pd.DataFrame()), max_rows=5000)
+            with tabs[1]:
+                display_df(pred.get("Prediccion_Resumen_Cuenta", pd.DataFrame()), max_rows=5000)
+            with tabs[2]:
+                display_df(pred.get("Prediccion_Area_Cargo", pd.DataFrame()), max_rows=5000)
+            with tabs[3]:
+                display_df(pred.get("Alertas_Prediccion", pd.DataFrame()), max_rows=2000)
+            with tabs[4]:
+                display_df(pred.get("MD_Valor_Hora", pd.DataFrame()), max_rows=5000)
+            st.download_button("📥 Descargar Excel predicción", make_prediction_excel(pred), file_name=f"prediccion_horas_{periodo_pred.replace('.', '')}_{datetime.now():%Y%m%d_%H%M}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+elif page == "4. Diagnóstico y alertas":
+    st.subheader("4. Diagnóstico y alertas")
+    res = st.session_state.get("resultado_v11")
     if not res:
         st.warning("Primero procesa los archivos en la pantalla de cargue.")
     else:
@@ -1296,18 +1918,22 @@ elif page == "3. Diagnóstico y alertas":
         with tabs[3]:
             display_df(res["extras"].get("Headcount_Usado", pd.DataFrame()), max_rows=5000)
         with tabs[4]:
-            st.markdown("#### Muestra detalle comparativo")
             display_df(res["report"].get("Detalle_Comparativo", pd.DataFrame()), max_rows=5000)
 
-elif page == "4. Instructivo":
-    st.subheader("4. Instructivo de uso y lectura")
+elif page == "5. Instructivo":
+    st.subheader("5. Instructivo de uso y lectura")
     st.markdown(
         """
-### Objetivo
-La herramienta compara **Pagado real vs Provisión vs Proyección** por mes, área de negocio, cargo homologado, concepto y tipo de hora.
+### Objetivo principal
+El aplicativo sirve para alimentar el **modelo financiero de nómina** con una visión confiable de horas, recargos y compensatorios.
 
-### Regla principal: pago mes vencido
-Los archivos **CCNómina** y **Compensatorios** representan el mes de pago. Para comparar, la app los corre un mes atrás:
+Tiene dos módulos:
+
+1. **Comparativo histórico:** valida lo pagado contra lo provisionado y proyectado.
+2. **Predicción mes en curso:** estima cantidad y costo de horas del mes laborado actual, que se pagará el mes siguiente.
+
+### Regla de pago mes vencido
+Los archivos **CCNómina** y **Compensatorios** son mes de pago. La app los corre un mes atrás:
 
 | Mes pago | Mes novedad |
 |---|---|
@@ -1317,29 +1943,49 @@ Los archivos **CCNómina** y **Compensatorios** representan el mes de pago. Para
 | 05.2026 | 04.2026 |
 
 ### Homologación correcta
-La app no compara directamente por cargo textual del reporte. Primero construye un maestro:
+La app no compara por el texto suelto del cargo. Primero construye:
 
 **Posición → Función → Cargo homologado**
 
-1. Si se carga `Posiciones_homologadas`, se usa como maestro principal.
-2. Si no se carga, se construye desde los Headcount.
-3. Luego cada base se lleva a función y finalmente a cargo homologado con `Detalle Horas`.
+Esto evita que aparezcan variaciones como “Operador tienda”, “Operador de tienda” o “Operador Tienda Encargado” como cargos diferentes.
 
-### Headcount
-El HC se calcula por:
+### Comparativo histórico
+Granularidad ejecutiva:
 
-**Mes + Área negocio + Cargo homologado**
+**Mes novedad + Área negocio + Cargo homologado + Concepto + Tipo hora**
 
-Se excluyen Manager I, II, III y IV porque no aplican para horas/tiempo suplementario.
+El CECO queda en el detalle para auditoría.
 
-### Hojas del Excel
-- `Detalle_Comparativo`: granularidad máxima por CECO.
-- `Resumen_Ejecutivo`: Mes + Área + Cargo + Concepto + Tipo hora.
-- `Resumen_Ejecutivo_Sin_Ceros`: igual al ejecutivo, pero sin filas vacías.
-- `Resumen_Cargo_Homologado`: análisis por cargo.
-- `Indicadores_HC`: horas y valores por HC.
-- `Alertas`: calidad de cruces y datos.
-- `Maestro_Posicion_Funcion`: auditoría del maestro construido.
-- `Pendientes_Homologacion`: nombres que no se pudieron homologar.
+### Predicción
+La predicción toma:
+
+- Histórico del comparativo.
+- Interfaces regionales del mes más reciente.
+- Proyección y provisión del mes a estimar.
+- Headcount actual.
+- MD actual para salario total y valor hora.
+- Factores por concepto.
+- Cuentas contables.
+
+### Costeo
+Desde el MD actual se calcula:
+
+**Salario total = salario base + bonos salariales vigentes**
+
+Luego:
+
+**Valor hora = Salario total / Jornada vigente**
+
+Finalmente:
+
+**Costo estimado = Cantidad estimada × Valor hora × Factor concepto**
+
+### Salidas principales
+- Comparativo histórico.
+- Resumen ejecutivo.
+- Indicadores HC.
+- Predicción detalle.
+- Predicción por cuenta.
+- Alertas y pendientes de homologación.
         """
     )
