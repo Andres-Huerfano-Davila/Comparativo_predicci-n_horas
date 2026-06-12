@@ -682,7 +682,20 @@ def pretty_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def display_df(df: pd.DataFrame, height: Optional[int] = None):
-    st.dataframe(pretty_df(df), use_container_width=True, height=height)
+    # Streamlit no acepta height=None en versiones recientes.
+    # Si no se envía altura, dejamos que Streamlit use la altura automática.
+    data = pretty_df(df)
+    if height is None:
+        st.dataframe(data, use_container_width=True)
+    else:
+        try:
+            h = int(height)
+            if h <= 0:
+                st.dataframe(data, use_container_width=True)
+            else:
+                st.dataframe(data, use_container_width=True, height=h)
+        except Exception:
+            st.dataframe(data, use_container_width=True)
 
 def dataframe_config(df: pd.DataFrame) -> Dict:
     # Se mantiene por compatibilidad, pero las tablas principales usan pretty_df/display_df
@@ -1652,34 +1665,92 @@ def to_excel_bytes(sheets: Dict[str, pd.DataFrame], include_chart: bool = True) 
     return output.getvalue()
 
 
+def _add_indicadores_hc(df: pd.DataFrame) -> pd.DataFrame:
+    """Agrega métricas por HC evitando división por cero."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if "hc" not in out.columns:
+        out["hc"] = 0.0
+    hc = pd.to_numeric(out["hc"], errors="coerce").fillna(0)
+    for c in ["cantidad_pagada", "cantidad_provisionada", "cantidad_proyectada", "valor_pagado", "valor_provisionado", "valor_proyectado"]:
+        if c not in out.columns:
+            out[c] = 0.0
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+    out["horas_pagadas_por_hc"] = np.where(hc > 0, out["cantidad_pagada"] / hc, 0)
+    out["horas_provisionadas_por_hc"] = np.where(hc > 0, out["cantidad_provisionada"] / hc, 0)
+    out["horas_proyectadas_por_hc"] = np.where(hc > 0, out["cantidad_proyectada"] / hc, 0)
+    out["valor_pagado_por_hc"] = np.where(hc > 0, out["valor_pagado"] / hc, 0)
+    out["valor_provisionado_por_hc"] = np.where(hc > 0, out["valor_provisionado"] / hc, 0)
+    out["valor_proyectado_por_hc"] = np.where(hc > 0, out["valor_proyectado"] / hc, 0)
+    return out
+
+def _sin_ceros(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    cols = [c for c in ["valor_pagado", "valor_provisionado", "valor_proyectado", "cantidad_pagada", "cantidad_provisionada", "cantidad_proyectada"] if c in df.columns]
+    if not cols:
+        return df
+    mask = df[cols].apply(pd.to_numeric, errors="coerce").fillna(0).abs().sum(axis=1) > 0
+    return df.loc[mask].copy()
+
 def resumenes_comparativo(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     if df is None or df.empty:
         return {}
-    res_mes = df.groupby("periodo_novedad", dropna=False).agg(
-        valor_pagado=("valor_pagado", "sum"),
-        valor_provisionado=("valor_provisionado", "sum"),
-        valor_proyectado=("valor_proyectado", "sum"),
-        cantidad_pagada=("cantidad_pagada", "sum"),
-        cantidad_provisionada=("cantidad_provisionada", "sum"),
-        cantidad_proyectada=("cantidad_proyectada", "sum"),
-    ).reset_index()
-    res_mes["orden"] = res_mes["periodo_novedad"].map(period_sort_key)
-    res_mes = res_mes.sort_values("orden").drop(columns="orden")
-    def agg_by(cols):
-        return df.groupby(cols, dropna=False).agg(
-            valor_pagado=("valor_pagado", "sum"),
-            valor_provisionado=("valor_provisionado", "sum"),
-            valor_proyectado=("valor_proyectado", "sum"),
-            dif_valor_pagado_vs_provision=("dif_valor_pagado_vs_provision", "sum"),
-            dif_valor_pagado_vs_proyeccion=("dif_valor_pagado_vs_proyeccion", "sum"),
-            cantidad_pagada=("cantidad_pagada", "sum"),
-            cantidad_provisionada=("cantidad_provisionada", "sum"),
-            cantidad_proyectada=("cantidad_proyectada", "sum"),
-        ).reset_index()
+
+    work = df.copy()
+    for c in ["valor_pagado", "valor_provisionado", "valor_proyectado", "cantidad_pagada", "cantidad_provisionada", "cantidad_proyectada", "hc"]:
+        if c not in work.columns:
+            work[c] = 0.0
+        work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0)
+
+    def sort_cols(d: pd.DataFrame) -> pd.DataFrame:
+        if d is None or d.empty or "periodo_novedad" not in d.columns:
+            return d
+        d = d.copy()
+        d["orden"] = d["periodo_novedad"].map(period_sort_key)
+        sort_by = ["orden"] + [c for c in ["area_negocio", "cargo_homologado", "concepto", "tipo_hora"] if c in d.columns]
+        return d.sort_values(sort_by).drop(columns="orden")
+
+    def agg_by(cols, hc_mode="max"):
+        agg = {
+            "valor_pagado": ("valor_pagado", "sum"),
+            "valor_provisionado": ("valor_provisionado", "sum"),
+            "valor_proyectado": ("valor_proyectado", "sum"),
+            "dif_valor_pagado_vs_provision": ("dif_valor_pagado_vs_provision", "sum"),
+            "dif_valor_pagado_vs_proyeccion": ("dif_valor_pagado_vs_proyeccion", "sum"),
+            "cantidad_pagada": ("cantidad_pagada", "sum"),
+            "cantidad_provisionada": ("cantidad_provisionada", "sum"),
+            "cantidad_proyectada": ("cantidad_proyectada", "sum"),
+        }
+        # El HC está asignado a varias filas por concepto; se usa max para no duplicarlo dentro de la misma granularidad.
+        if "hc" in work.columns:
+            agg["hc"] = ("hc", "max" if hc_mode == "max" else "sum")
+        out = work.groupby(cols, dropna=False).agg(**agg).reset_index()
+        return sort_cols(_add_indicadores_hc(out))
+
+    res_mes = agg_by(["periodo_novedad"], hc_mode="sum")
+    res_concepto = agg_by(["periodo_novedad", "concepto", "tipo_hora"])
+
+    # V8: resumen gerencial sin CECO, con Área negocio + Cargo homologado + Concepto + Tipo hora.
+    resumen_ejecutivo = agg_by(["periodo_novedad", "area_negocio", "cargo_homologado", "concepto", "tipo_hora"])
+    resumen_ejecutivo_sin_ceros = _sin_ceros(resumen_ejecutivo)
+
+    resumen_cargo = agg_by(["periodo_novedad", "area_negocio", "cargo_homologado"])
+    indicadores_hc = resumen_cargo[[c for c in [
+        "periodo_novedad", "area_negocio", "cargo_homologado", "hc",
+        "cantidad_pagada", "cantidad_provisionada", "cantidad_proyectada",
+        "horas_pagadas_por_hc", "horas_provisionadas_por_hc", "horas_proyectadas_por_hc",
+        "valor_pagado_por_hc", "valor_provisionado_por_hc", "valor_proyectado_por_hc"
+    ] if c in resumen_cargo.columns]].copy()
+
     return {
         "Resumen_mes": res_mes,
-        "Resumen_concepto": agg_by(["periodo_novedad", "concepto", "tipo_hora"]),
-        "Resumen_cargo": agg_by(["periodo_novedad", "cargo_homologado"]),
+        "Resumen_concepto": res_concepto,
+        "Resumen_Ejecutivo": resumen_ejecutivo,
+        "Resumen_Ejec_Sin_Ceros": resumen_ejecutivo_sin_ceros,
+        "Resumen_Cargo_Homologado": resumen_cargo,
+        "Indicadores_HC": indicadores_hc,
         "Resumen_area": agg_by(["periodo_novedad", "area_negocio"]),
     }
 
@@ -1946,30 +2017,38 @@ elif menu == "2. Comparativo histórico":
     k4.metric("Dif. pagado vs provisión", money_fmt(filt['dif_valor_pagado_vs_provision'].sum()))
 
     resumenes = st.session_state.get("resumenes_comparativo", resumenes_comparativo(filt))
-    tab1, tab2, tab3, tab4 = st.tabs(["Resumen", "Gráficas", "Detalle", "Alertas / Descargar"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Resumen ejecutivo", "Resúmenes", "Gráficas", "Detalle", "Alertas / Descargar"])
     with tab1:
+        st.markdown("#### Resumen ejecutivo")
+        st.caption("Granularidad: Mes novedad + Área negocio + Cargo homologado + Concepto + Tipo hora. No incluye CECO para mantener una lectura gerencial.")
+        display_df(resumenes.get("Resumen_Ejec_Sin_Ceros", pd.DataFrame()), height=520)
+        st.markdown("#### Resumen por cargo homologado")
+        display_df(resumenes.get("Resumen_Cargo_Homologado", pd.DataFrame()), height=360)
+    with tab2:
         st.markdown("#### Resumen por mes")
         display_df(resumenes.get("Resumen_mes", pd.DataFrame()))
         st.markdown("#### Resumen por concepto")
         display_df(resumenes.get("Resumen_concepto", pd.DataFrame()))
-    with tab2:
+        st.markdown("#### Indicadores HC")
+        display_df(resumenes.get("Indicadores_HC", pd.DataFrame()), height=420)
+    with tab3:
         rm = resumenes.get("Resumen_mes", pd.DataFrame())
         if not rm.empty:
             fig = px.line(rm, x="periodo_novedad", y=["valor_pagado", "valor_provisionado", "valor_proyectado"], markers=True, title="Valor mensual: pagado vs provisión vs proyección")
             st.plotly_chart(fig, use_container_width=True)
-        rc = resumenes.get("Resumen_cargo", pd.DataFrame())
+        rc = resumenes.get("Resumen_Cargo_Homologado", pd.DataFrame())
         if not rc.empty:
             top = rc.groupby("cargo_homologado", dropna=False).agg(dif=("dif_valor_pagado_vs_provision", "sum")).reset_index()
             top["abs_dif"] = top["dif"].abs()
             top = top.sort_values("abs_dif", ascending=False).head(20)
             fig2 = px.bar(top, x="dif", y="cargo_homologado", orientation="h", title="Top cargos por desviación pagado vs provisión")
             st.plotly_chart(fig2, use_container_width=True)
-    with tab3:
-        display_df(filt, height=520)
     with tab4:
+        display_df(filt, height=520)
+    with tab5:
         alertas = st.session_state.get("alertas_comparativo_filtrado", build_alertas_comparativo(filt, [], threshold))
         display_df(alertas)
-        sheets = {"Comparativo_general": filt, **resumenes, "Alertas": alertas}
+        sheets = {"Detalle_Comparativo": filt, **resumenes, "Comparativo_Sin_Ceros": _sin_ceros(filt), "Alertas": alertas}
         if st.session_state.get("hom_df") is not None and not st.session_state.hom_df.empty:
             sheets["Homologacion_usada"] = st.session_state.hom_df
         if st.session_state.get("excl_hc") is not None and not st.session_state.excl_hc.empty:
