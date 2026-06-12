@@ -74,7 +74,10 @@ CUENTAS_TEMPLATE = pd.DataFrame(
 )
 
 KEY_COMPARATIVO = ["periodo_novedad", "concepto", "tipo_hora", "cargo_homologado", "area_negocio", "ceco"]
-KEY_HC = ["periodo_novedad", "cargo_homologado", "area_negocio", "ceco"]
+KEY_HC = ["periodo_novedad", "cargo_homologado", "area_negocio"]
+# El HC se cruza a nivel cargo homologado + área + mes.
+# No se cruza por CECO para evitar ceros cuando el mismo cargo/función aparece con CECO distinto
+# entre pago, provisión, proyección y headcount.
 
 # =============================================================
 # UTILIDADES
@@ -1383,13 +1386,13 @@ def prediccion_mes(
         if "periodo_novedad" in hc_actual.columns:
             hc_actual = hc_actual[hc_actual["periodo_novedad"].eq(mes_pred)].drop(columns=["periodo_novedad"], errors="ignore")
         if not hc_actual.empty:
-            hc_actual = hc_actual.groupby(["cargo_homologado", "area_negocio", "ceco"], dropna=False).agg(hc_actual=("hc_actual", "sum")).reset_index()
+            hc_actual = hc_actual.groupby(["cargo_homologado", "area_negocio"], dropna=False).agg(hc_actual=("hc_actual", "sum")).reset_index()
     if hc_actual is None or hc_actual.empty:
         if md_actual is not None and not md_actual.empty:
-            hc_actual = md_actual.groupby(["cargo_homologado", "area_negocio", "ceco"], dropna=False).agg(hc_actual=("sap", "nunique")).reset_index()
+            hc_actual = md_actual.groupby(["cargo_homologado", "area_negocio"], dropna=False).agg(hc_actual=("sap", "nunique")).reset_index()
             alerts.append("No encontré HC procesado para el mes seleccionado; usé el MD actual como HC base de predicción.")
         else:
-            hc_actual = pd.DataFrame(columns=["cargo_homologado", "area_negocio", "ceco", "hc_actual"])
+            hc_actual = pd.DataFrame(columns=["cargo_homologado", "area_negocio", "hc_actual"])
             alerts.append("No hay HC actual ni MD actual suficiente. La predicción de cantidades puede quedar en cero.")
 
     # Métricas históricas de pagado.
@@ -1431,8 +1434,8 @@ def prediccion_mes(
         if not itf.empty:
             # Agregamos por llave y pegamos HC del mismo periodo si existe en comparativo.
             itf_agg = itf.groupby(["periodo_novedad"] + group_cols, dropna=False).agg(cantidad_interface=("cantidad_interface", "sum")).reset_index()
-            hcs = comparativo.groupby(["periodo_novedad", "cargo_homologado", "area_negocio", "ceco"], dropna=False).agg(hc=("hc", "max")).reset_index()
-            itf_agg = itf_agg.merge(hcs, on=["periodo_novedad", "cargo_homologado", "area_negocio", "ceco"], how="left")
+            hcs = comparativo.groupby(["periodo_novedad", "cargo_homologado", "area_negocio"], dropna=False).agg(hc=("hc", "max")).reset_index()
+            itf_agg = itf_agg.merge(hcs, on=["periodo_novedad", "cargo_homologado", "area_negocio"], how="left")
             itf_agg = itf_agg.merge(cal, on="periodo_novedad", how="left")
             itf_agg["driver"] = itf_agg.apply(lambda r: driver_days(r["concepto"], r.get("dias_mes", 30), r.get("domingos", 4), r.get("festivos", 0)), axis=1)
             itf_agg["rate_interface"] = np.where((itf_agg["hc"] > 0) & (itf_agg["driver"] > 0), itf_agg["cantidad_interface"] / itf_agg["hc"] / itf_agg["driver"], np.nan)
@@ -1448,7 +1451,7 @@ def prediccion_mes(
         pr = proyeccion[proyeccion["periodo_novedad"].eq(mes_pred)].copy()
         if not pr.empty:
             pr = pr.groupby(group_cols, dropna=False).agg(cantidad_proyectada_mes=("cantidad_proyectada", "sum"), valor_proyectado_mes=("valor_proyectado", "sum")).reset_index()
-            pr = pr.merge(hc_actual, on=["cargo_homologado", "area_negocio", "ceco"], how="left")
+            pr = pr.merge(hc_actual, on=["cargo_homologado", "area_negocio"], how="left")
             pr["driver_pred"] = pr["concepto"].map(lambda c: driver_days(c, dias_pred, domingos_pred, festivos_pred))
             pr["rate_proyeccion"] = np.where((pr["hc_actual"] > 0) & (pr["driver_pred"] > 0), pr["cantidad_proyectada_mes"] / pr["hc_actual"] / pr["driver_pred"], np.nan)
             rate_proy = pr[group_cols + ["rate_proyeccion", "cantidad_proyectada_mes", "valor_proyectado_mes"]]
@@ -1465,7 +1468,7 @@ def prediccion_mes(
     # Aseguramos que cada cargo actual tenga los conceptos observados en la compañía.
     if hc_actual is not None and not hc_actual.empty and not uni.empty:
         conceptos_obs = uni[["concepto", "tipo_hora"]].drop_duplicates()
-        cargos = hc_actual[["cargo_homologado", "area_negocio", "ceco"]].drop_duplicates()
+        cargos = hc_actual[["cargo_homologado", "area_negocio"]].drop_duplicates()
         expanded = cargos.merge(conceptos_obs, how="cross")
         uni = pd.concat([uni, expanded[group_cols]], ignore_index=True).drop_duplicates()
 
@@ -1473,7 +1476,7 @@ def prediccion_mes(
     for df in [ultimo_pago, prom_hist, rate_interface, rate_proy]:
         if df is not None and not df.empty:
             pred = pred.merge(df, on=group_cols, how="left")
-    pred = pred.merge(hc_actual, on=["cargo_homologado", "area_negocio", "ceco"], how="left")
+    pred = pred.merge(hc_actual, on=["cargo_homologado", "area_negocio"], how="left")
     pred["hc_actual"] = to_num(pred.get("hc_actual", 0))
     pred["driver_pred"] = pred["concepto"].map(lambda c: driver_days(c, dias_pred, domingos_pred, festivos_pred))
 
