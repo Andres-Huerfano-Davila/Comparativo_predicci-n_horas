@@ -1147,29 +1147,212 @@ def process_headcount(files, hom) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFr
     return hc, excl_df, detail, alerts
 
 
+
+def build_maestro_posicion_funcion(hc_detail: pd.DataFrame, hom=None) -> pd.DataFrame:
+    """Construye el maestro base de homologación desde TODOS los Headcount cargados.
+
+    Idea de negocio V9:
+    1) El Headcount trae posición y función del período.
+    2) Antes de comparar, convertimos cualquier texto de posición/cargo de las fuentes
+       a la función correspondiente usando este maestro.
+    3) Solo después homologamos la función a los agrupados ejecutivos: Jefe Tienda,
+       Operador Tienda, Op. Cedi, etc.
+
+    Esto evita que el comparativo se fragmente por variaciones de nombre de posición
+    como "Operador tienda", "Operador de tienda", "Operador Tienda Encargado".
+    """
+    cols_out = [
+        "periodo_novedad", "posicion_original", "posicion_key",
+        "funcion", "funcion_nombre", "funcion_key", "cargo_homologado",
+        "area_negocio", "ceco", "area_nomina",
+    ]
+    if hc_detail is None or hc_detail.empty:
+        return pd.DataFrame(columns=cols_out)
+    d = hc_detail.copy()
+    for c in ["periodo_novedad", "posicion_original", "funcion", "funcion_nombre", "cargo_original", "area_negocio", "ceco", "area_nomina"]:
+        if c not in d.columns:
+            d[c] = ""
+    # Función texto: prioriza texto de función; si no existe, usa cargo_original; si no existe, posición.
+    d["funcion_nombre"] = d["funcion_nombre"].astype(str)
+    d["posicion_original"] = d["posicion_original"].astype(str)
+    d["cargo_original"] = d["cargo_original"].astype(str)
+    d["funcion_nombre"] = np.where(
+        d["funcion_nombre"].str.strip().ne("") & d["funcion_nombre"].str.upper().ne("NAN"),
+        d["funcion_nombre"],
+        np.where(d["cargo_original"].str.strip().ne(""), d["cargo_original"], d["posicion_original"])
+    )
+    d["posicion_key"] = d["posicion_original"].map(norm_text)
+    d["funcion_key"] = d["funcion_nombre"].map(norm_text)
+    # Recalcula cargo homologado estrictamente desde función.
+    homol = [homologar_cargo(fun, fn, hom) for fun, fn in zip(d["funcion"], d["funcion_nombre"])]
+    d["cargo_homologado"] = [x[0] for x in homol]
+    # Filtra llaves vacías.
+    d = d[(d["posicion_key"].astype(str).str.strip().ne("")) | (d["funcion_key"].astype(str).str.strip().ne(""))].copy()
+    if d.empty:
+        return pd.DataFrame(columns=cols_out)
+    # Preferir registros con función texto/código y con área clasificada.
+    d["_score"] = 0
+    d["_score"] += d["funcion_nombre"].astype(str).str.strip().ne("").astype(int) * 4
+    d["_score"] += d["funcion"].astype(str).str.strip().ne("").astype(int) * 2
+    d["_score"] += d["area_negocio"].astype(str).str.upper().ne("SIN CLASIFICAR").astype(int)
+    d = d.sort_values(["periodo_novedad", "_score"], ascending=[True, False])
+    keep_cols = [c for c in cols_out if c in d.columns]
+    # Maestro por posición del período.
+    maestro = d[keep_cols].drop_duplicates(["periodo_novedad", "posicion_key"], keep="first")
+    # Agrega filas alternas por función_key para que si la fuente ya trae función, también cruce.
+    alt = d[keep_cols].copy()
+    alt["posicion_key"] = alt["funcion_key"]
+    maestro = pd.concat([maestro, alt], ignore_index=True)
+    maestro = maestro.drop_duplicates(["periodo_novedad", "posicion_key"], keep="first")
+    return maestro.reset_index(drop=True)
+
+
+def apply_maestro_posicion_funcion(df: pd.DataFrame, maestro: pd.DataFrame, hom=None, fuente: str = "") -> pd.DataFrame:
+    """Convierte cargo/posición original de una fuente a función del Headcount del período.
+
+    Prioridad:
+    1) periodo_novedad + nombre normalizado de posición/cargo contra maestro HC.
+    2) nombre normalizado contra maestro global HC (cuando no coincide el período exacto).
+    3) si no cruza, conserva función/cargo original y deja método para revisión.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for c in ["periodo_novedad", "cargo_original", "funcion", "funcion_nombre", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]:
+        if c not in out.columns:
+            out[c] = ""
+    out["cargo_reporte_original"] = out["cargo_original"].astype(str)
+    out["cargo_key_src"] = out["cargo_original"].map(norm_text)
+    # Si viene una función_nombre explícita, también puede ser llave.
+    out["funcion_key_src"] = out.get("funcion_nombre", pd.Series([""] * len(out))).map(norm_text)
+
+    if maestro is not None and not maestro.empty:
+        m = maestro.copy()
+        for c in ["periodo_novedad", "posicion_key", "funcion", "funcion_nombre", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]:
+            if c not in m.columns:
+                m[c] = ""
+        m = m.drop_duplicates(["periodo_novedad", "posicion_key"], keep="first")
+        m2 = m[["periodo_novedad", "posicion_key", "funcion", "funcion_nombre", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]].copy()
+        m2 = m2.rename(columns={
+            "funcion": "funcion_hc",
+            "funcion_nombre": "funcion_nombre_hc",
+            "cargo_homologado": "cargo_homologado_hc",
+            "area_negocio": "area_negocio_hc",
+            "ceco": "ceco_hc",
+            "area_nomina": "area_nomina_hc",
+        })
+        out = out.merge(m2, left_on=["periodo_novedad", "cargo_key_src"], right_on=["periodo_novedad", "posicion_key"], how="left")
+        # Fallback global: si la posición existe en otro Headcount cargado, usarla.
+        missing = out["funcion_nombre_hc"].isna() | out["funcion_nombre_hc"].astype(str).str.strip().eq("")
+        if missing.any():
+            mg = m.sort_values("periodo_novedad").drop_duplicates(["posicion_key"], keep="last")
+            mg = mg[["posicion_key", "funcion", "funcion_nombre", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]].rename(columns={
+                "funcion": "funcion_hc_g",
+                "funcion_nombre": "funcion_nombre_hc_g",
+                "cargo_homologado": "cargo_homologado_hc_g",
+                "area_negocio": "area_negocio_hc_g",
+                "ceco": "ceco_hc_g",
+                "area_nomina": "area_nomina_hc_g",
+            })
+            tmp = out.loc[missing].drop(columns=[c for c in mg.columns if c != "posicion_key"], errors="ignore")
+            tmp = tmp.merge(mg, left_on="cargo_key_src", right_on="posicion_key", how="left")
+            for base_col in ["funcion", "funcion_nombre", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]:
+                gcol = f"{base_col}_hc_g"
+                if gcol in tmp.columns:
+                    out.loc[missing, f"{base_col}_hc_g"] = tmp[gcol].values
+        else:
+            for base_col in ["funcion", "funcion_nombre", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]:
+                out[f"{base_col}_hc_g"] = np.nan
+
+        # Aplica función encontrada por período o global.
+        found_period = out["funcion_nombre_hc"].notna() & out["funcion_nombre_hc"].astype(str).str.strip().ne("")
+        found_global = (~found_period) & out.get("funcion_nombre_hc_g", pd.Series([np.nan]*len(out))).notna() & out.get("funcion_nombre_hc_g", pd.Series([""]*len(out))).astype(str).str.strip().ne("")
+        out["funcion"] = np.select([found_period, found_global], [out.get("funcion_hc", ""), out.get("funcion_hc_g", "")], default=out["funcion"])
+        out["funcion_nombre"] = np.select([found_period, found_global], [out.get("funcion_nombre_hc", ""), out.get("funcion_nombre_hc_g", "")], default=np.where(out["funcion_nombre"].astype(str).str.strip().ne(""), out["funcion_nombre"], out["cargo_original"]))
+        # Cargo original para el comparativo pasa a ser la función ya normalizada.
+        out["cargo_original"] = out["funcion_nombre"]
+        homol = [homologar_cargo(fun, fn, hom) for fun, fn in zip(out["funcion"], out["funcion_nombre"])]
+        out["cargo_homologado"] = [x[0] for x in homol]
+        out["cargo_homologado_ok"] = [x[1] for x in homol]
+        # Área: prioriza la fuente; si está sin clasificar, usa HC.
+        area_src_bad = out["area_negocio"].astype(str).str.strip().eq("") | out["area_negocio"].astype(str).str.upper().eq("SIN CLASIFICAR")
+        out["area_negocio"] = np.where(area_src_bad & found_period, out.get("area_negocio_hc", out["area_negocio"]), out["area_negocio"])
+        out["area_negocio"] = np.where(area_src_bad & found_global, out.get("area_negocio_hc_g", out["area_negocio"]), out["area_negocio"])
+        out["metodo_homologacion"] = np.select(
+            [found_period, found_global],
+            ["Posición/Cargo fuente → Headcount del período → Función", "Posición/Cargo fuente → Headcount consolidado → Función"],
+            default="Sin cruce en Headcount; función/cargo original"
+        )
+        drop_aux = [c for c in out.columns if c.endswith("_hc") or c.endswith("_hc_g") or c in ["posicion_key", "posicion_key_x", "posicion_key_y", "cargo_key_src", "funcion_key_src"]]
+        out = out.drop(columns=drop_aux, errors="ignore")
+    else:
+        out["funcion_nombre"] = np.where(out["funcion_nombre"].astype(str).str.strip().ne(""), out["funcion_nombre"], out["cargo_original"])
+        out["cargo_original"] = out["funcion_nombre"]
+        homol = [homologar_cargo(fun, fn, hom) for fun, fn in zip(out["funcion"], out["funcion_nombre"])]
+        out["cargo_homologado"] = [x[0] for x in homol]
+        out["cargo_homologado_ok"] = [x[1] for x in homol]
+        out["metodo_homologacion"] = "Sin maestro Headcount; función/cargo original"
+    return out
+
+
+def force_key_types(df: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
+    """Evita ValueError de pandas al hacer merge por llaves con dtype distinto."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for k in keys:
+        if k not in out.columns:
+            out[k] = ""
+        # Todo key se compara como texto normalizado/controlado.
+        out[k] = out[k].fillna("").astype(str)
+        if k == "ceco":
+            out[k] = out[k].map(clean_ceco)
+        elif k == "concepto":
+            out[k] = out[k].map(lambda x: clean_code(x).upper())
+        elif k == "periodo_novedad":
+            out[k] = out[k].map(lambda x: period_from_any(x, None) or str(x))
+        else:
+            out[k] = out[k].str.strip()
+    return out
+
 def aggregate_sources(pagado, provision, proyeccion, hc) -> pd.DataFrame:
+    # V9: antes de agrupar/mergear, fuerza llaves a texto para evitar errores por dtype distinto
+    # (por ejemplo CECO numérico en una fuente y texto en otra).
+    pagado = force_key_types(pagado, KEY_COMPARATIVO) if pagado is not None else pagado
+    provision = force_key_types(provision, KEY_COMPARATIVO) if provision is not None else provision
+    proyeccion = force_key_types(proyeccion, KEY_COMPARATIVO) if proyeccion is not None else proyeccion
+    hc = force_key_types(hc, KEY_HC) if hc is not None else hc
+
     frames = []
     if pagado is not None and not pagado.empty:
         p = pagado.groupby(KEY_COMPARATIVO, dropna=False).agg(
             cantidad_pagada=("cantidad_pagada", "sum"),
             valor_pagado=("valor_pagado", "sum"),
         ).reset_index()
+        p = force_key_types(p, KEY_COMPARATIVO)
         frames.append(p)
     comp = frames[0] if frames else pd.DataFrame(columns=KEY_COMPARATIVO)
+    comp = force_key_types(comp, KEY_COMPARATIVO)
+
     if provision is not None and not provision.empty:
         pr = provision.groupby(KEY_COMPARATIVO, dropna=False).agg(
             cantidad_provisionada=("cantidad_provisionada", "sum"),
             valor_provisionado=("valor_provisionado", "sum"),
         ).reset_index()
+        pr = force_key_types(pr, KEY_COMPARATIVO)
         comp = comp.merge(pr, on=KEY_COMPARATIVO, how="outer")
     if proyeccion is not None and not proyeccion.empty:
         py = proyeccion.groupby(KEY_COMPARATIVO, dropna=False).agg(
             cantidad_proyectada=("cantidad_proyectada", "sum"),
             valor_proyectado=("valor_proyectado", "sum"),
         ).reset_index()
+        py = force_key_types(py, KEY_COMPARATIVO)
         comp = comp.merge(py, on=KEY_COMPARATIVO, how="outer")
     if hc is not None and not hc.empty:
+        hc = force_key_types(hc, KEY_HC)
+        comp = force_key_types(comp, KEY_COMPARATIVO)
         comp = comp.merge(hc, on=KEY_HC, how="left")
+
     for c in ["cantidad_pagada", "valor_pagado", "cantidad_provisionada", "valor_provisionado", "cantidad_proyectada", "valor_proyectado", "hc"]:
         if c not in comp.columns:
             comp[c] = 0.0
@@ -1180,9 +1363,12 @@ def aggregate_sources(pagado, provision, proyeccion, hc) -> pd.DataFrame:
     comp["dif_cant_pagada_vs_proyeccion"] = comp["cantidad_pagada"] - comp["cantidad_proyectada"]
     comp["pct_desv_provision"] = np.where(comp["valor_provisionado"].abs() > 0, comp["dif_valor_pagado_vs_provision"] / comp["valor_provisionado"], np.nan)
     comp["pct_desv_proyeccion"] = np.where(comp["valor_proyectado"].abs() > 0, comp["dif_valor_pagado_vs_proyeccion"] / comp["valor_proyectado"], np.nan)
+    if comp.empty:
+        return comp
     comp["orden_periodo"] = comp["periodo_novedad"].map(period_sort_key)
-    comp = comp.sort_values(["orden_periodo", "area_negocio", "cargo_homologado", "concepto"]).drop(columns=["orden_periodo"])
+    comp = comp.sort_values(["orden_periodo", "area_negocio", "cargo_homologado", "concepto"], na_position="last").drop(columns=["orden_periodo"], errors="ignore")
     return comp
+
 
 # =============================================================
 # PREDICCIÓN
@@ -1943,15 +2129,28 @@ if menu == "1. Cargue y procesamiento":
         comp_df, alerts = process_compensatorios(comp_files, hom)
         all_alerts += alerts
         pagado_df = pd.concat([x for x in [cc_df, comp_df] if x is not None and not x.empty], ignore_index=True) if ((cc_df is not None and not cc_df.empty) or (comp_df is not None and not comp_df.empty)) else pd.DataFrame()
-        progress.progress(45, text="Procesando Headcount y maestro de cargos por período...")
+        progress.progress(45, text="Procesando Headcount y construyendo maestro Posición → Función...")
         hc_df, excl_hc, hc_detail, alerts = process_headcount(hc_files, hom)
         all_alerts += alerts
-        progress.progress(60, text="Procesando provisión con homologación por posición del período...")
+        maestro_pos_func = build_maestro_posicion_funcion(hc_detail, hom)
+        if maestro_pos_func is not None and not maestro_pos_func.empty:
+            all_alerts.append(f"Maestro Posición → Función: {len(maestro_pos_func):,.0f} combinaciones construidas desde Headcount consolidado.")
+        else:
+            all_alerts.append("Maestro Posición → Función: no se pudo construir; se usará homologación directa por función/cargo original.")
+
+        progress.progress(58, text="Aplicando maestro Posición → Función al pagado real...")
+        pagado_df = apply_maestro_posicion_funcion(pagado_df, maestro_pos_func, hom, fuente="Pagado")
+
+        progress.progress(65, text="Procesando provisión...")
         provision_df, alerts = process_provision(prov_files, hom, hc_detail)
         all_alerts += alerts
-        progress.progress(75, text="Procesando proyección con SAP/posición del período o Función...")
+        provision_df = apply_maestro_posicion_funcion(provision_df, maestro_pos_func, hom, fuente="Provisión")
+
+        progress.progress(78, text="Procesando proyección...")
         proyeccion_df, alerts = process_proyeccion(proy_files, hom, hc_detail)
         all_alerts += alerts
+        proyeccion_df = apply_maestro_posicion_funcion(proyeccion_df, maestro_pos_func, hom, fuente="Proyección")
+
         progress.progress(90, text="Construyendo comparativo...")
         comparativo = aggregate_sources(pagado_df, provision_df, proyeccion_df, hc_df)
         alertas_df = build_alertas_comparativo(comparativo, all_alerts)
@@ -1965,6 +2164,7 @@ if menu == "1. Cargue y procesamiento":
         st.session_state.hc_df = hc_df
         st.session_state.hc_detail = hc_detail
         st.session_state.excl_hc = excl_hc
+        st.session_state.maestro_pos_func = maestro_pos_func
         st.session_state.comparativo = comparativo
         st.session_state.alertas = alertas_df
         st.session_state.processed = True
@@ -2050,6 +2250,10 @@ elif menu == "2. Comparativo histórico":
         display_df(resumenes.get("Resumen_concepto", pd.DataFrame()))
         st.markdown("#### Indicadores HC")
         display_df(resumenes.get("Indicadores_HC", pd.DataFrame()), height=420)
+        if st.session_state.get("maestro_pos_func") is not None and not st.session_state.maestro_pos_func.empty:
+            st.markdown("#### Maestro Posición → Función (desde Headcount)")
+            st.caption("Este maestro se usa antes de comparar para convertir posiciones/cargos de las fuentes a Función y luego a Cargo homologado.")
+            display_df(st.session_state.maestro_pos_func.head(500), height=360)
     with tab3:
         rm = resumenes.get("Resumen_mes", pd.DataFrame())
         if not rm.empty:
@@ -2072,6 +2276,8 @@ elif menu == "2. Comparativo histórico":
             sheets["Homologacion_usada"] = st.session_state.hom_df
         if st.session_state.get("excl_hc") is not None and not st.session_state.excl_hc.empty:
             sheets["Excluidos_HC"] = st.session_state.excl_hc
+        if st.session_state.get("maestro_pos_func") is not None and not st.session_state.maestro_pos_func.empty:
+            sheets["Maestro_Posicion_Funcion"] = st.session_state.maestro_pos_func
         xbytes = to_excel_bytes(sheets, include_chart=True)
         st.download_button("⬇️ Descargar Excel comparativo", data=xbytes, file_name="comparativo_historico_horas.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
