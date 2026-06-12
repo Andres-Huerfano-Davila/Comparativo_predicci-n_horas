@@ -1,4 +1,4 @@
-# Comparativo y predicción de horas de nómina - V4
+# Comparativo y predicción de horas de nómina 
 
 Herramienta Streamlit con dos módulos:
 
