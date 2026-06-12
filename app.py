@@ -102,6 +102,24 @@ def norm_text(x) -> str:
     return x
 
 
+
+
+def is_blank_value(x) -> bool:
+    if x is None:
+        return True
+    try:
+        if pd.isna(x):
+            return True
+    except Exception:
+        pass
+    t = str(x).strip()
+    return t == "" or t.upper() in {"NAN", "NONE", "NAT", "NULL", "<NA>"}
+
+def has_text_series(s: pd.Series) -> pd.Series:
+    if s is None:
+        return pd.Series(dtype=bool)
+    return (~s.isna()) & (~s.astype(str).str.strip().str.upper().isin(["", "NAN", "NONE", "NAT", "NULL", "<NA>"]))
+
 def clean_code(x) -> str:
     if pd.isna(x):
         return ""
@@ -734,6 +752,7 @@ def process_ccnomina(files, hom) -> Tuple[pd.DataFrame, List[str]]:
             out["periodo_pago"] = df[col_period].map(lambda x: period_from_any(x, name)) if col_period else period_from_any(None, name)
             out["periodo_pago"] = fill_period_series(out["periodo_pago"], period_from_any(None, name))
             out["periodo_novedad"] = out["periodo_pago"].map(lambda p: shift_period(p, -1))
+            out["sap"] = df[col_sap].map(clean_code) if col_sap else ""
             out["concepto"] = df[col_concept].map(lambda x: clean_code(x).upper())
             out = out[out["concepto"].isin(CONCEPTOS)].copy()
             if out.empty:
@@ -792,6 +811,7 @@ def process_compensatorios(files, hom) -> Tuple[pd.DataFrame, List[str]]:
             out["periodo_pago"] = df[col_period].map(lambda x: period_from_any(x, name)) if col_period else period_from_any(None, name)
             out["periodo_pago"] = fill_period_series(out["periodo_pago"], period_from_any(None, name))
             out["periodo_novedad"] = out["periodo_pago"].map(lambda p: shift_period(p, -1))
+            out["sap"] = df[col_sap].map(clean_code) if col_sap else ""
             out["concepto"] = df[col_concept].map(lambda x: clean_code(x).upper()) if col_concept else "Y350"
             out["concepto"] = out["concepto"].replace("", "Y350").fillna("Y350")
             out = out[out["concepto"].eq("Y350")].copy()
@@ -847,19 +867,21 @@ def process_provision(files, hom, md_periodo=None) -> Tuple[pd.DataFrame, List[s
             header_df = read_table(f, sheet_name=sh, nrows=0)
             header_df.columns = [str(c).strip() for c in header_df.columns]
             col_source = find_col(header_df, ["Source.Name", "MES", "Archivo", "Periodo"], required=False)
+            col_sap = find_col(header_df, ["IdentificacionEmpleado", "IdentificaciónEmpleado", "SAP", "Nº pers.", "Número de personal"], required=False)
             col_concept = find_col(header_df, ["Valores", "Concepto", "CC-n."], required=True)
             col_qty = find_col(header_df, ["Total", "Cantidad"], required=True)
             col_val = find_col(header_df, ["PROVISIÓN", "Provision", "Valor provisionado"], required=True)
             col_ceco = find_col(header_df, ["CECO", "Ce.coste"], required=False)
             col_tipo = find_col(header_df, ["TIPO", "Tipo"], required=False)
             col_cargo = find_col(header_df, ["CARGO", "Cargo", "Funcion"], required=False)
-            needed_cols = list(dict.fromkeys([c for c in [col_source, col_concept, col_qty, col_val, col_ceco, col_tipo, col_cargo] if c]))
+            needed_cols = list(dict.fromkeys([c for c in [col_source, col_sap, col_concept, col_qty, col_val, col_ceco, col_tipo, col_cargo] if c]))
             df = read_table(f, sheet_name=sh, usecols=needed_cols)
             df.columns = [str(c).strip() for c in df.columns]
             out = pd.DataFrame()
             out["source_file"] = name
             src = df[col_source] if col_source else pd.Series([name] * len(df))
             out["periodo_novedad"] = fill_period_series(src.map(lambda x: period_from_any(x, name)), period_from_any(None, name))
+            out["sap"] = df[col_sap].map(clean_code) if col_sap else ""
             out["concepto"] = df[col_concept].map(lambda x: clean_code(x).upper())
             out = out[out["concepto"].isin(CONCEPTOS)].copy()
             idx = out.index
@@ -1162,25 +1184,23 @@ def build_maestro_posicion_funcion(hc_detail: pd.DataFrame, hom=None) -> pd.Data
     como "Operador tienda", "Operador de tienda", "Operador Tienda Encargado".
     """
     cols_out = [
-        "periodo_novedad", "posicion_original", "posicion_key",
+        "periodo_novedad", "sap", "posicion_original", "posicion_key",
         "funcion", "funcion_nombre", "funcion_key", "cargo_homologado",
         "area_negocio", "ceco", "area_nomina",
     ]
     if hc_detail is None or hc_detail.empty:
         return pd.DataFrame(columns=cols_out)
     d = hc_detail.copy()
-    for c in ["periodo_novedad", "posicion_original", "funcion", "funcion_nombre", "cargo_original", "area_negocio", "ceco", "area_nomina"]:
+    for c in ["periodo_novedad", "sap", "posicion_original", "funcion", "funcion_nombre", "cargo_original", "area_negocio", "ceco", "area_nomina"]:
         if c not in d.columns:
             d[c] = ""
     # Función texto: prioriza texto de función; si no existe, usa cargo_original; si no existe, posición.
     d["funcion_nombre"] = d["funcion_nombre"].astype(str)
     d["posicion_original"] = d["posicion_original"].astype(str)
     d["cargo_original"] = d["cargo_original"].astype(str)
-    d["funcion_nombre"] = np.where(
-        d["funcion_nombre"].str.strip().ne("") & d["funcion_nombre"].str.upper().ne("NAN"),
-        d["funcion_nombre"],
-        np.where(d["cargo_original"].str.strip().ne(""), d["cargo_original"], d["posicion_original"])
-    )
+    fn_ok = has_text_series(d["funcion_nombre"])
+    cargo_ok = has_text_series(d["cargo_original"])
+    d["funcion_nombre"] = np.where(fn_ok, d["funcion_nombre"], np.where(cargo_ok, d["cargo_original"], d["posicion_original"]))
     d["posicion_key"] = d["posicion_original"].map(norm_text)
     d["funcion_key"] = d["funcion_nombre"].map(norm_text)
     # Recalcula cargo homologado estrictamente desde función.
@@ -1218,7 +1238,7 @@ def apply_maestro_posicion_funcion(df: pd.DataFrame, maestro: pd.DataFrame, hom=
     if df is None or df.empty:
         return df
     out = df.copy()
-    for c in ["periodo_novedad", "cargo_original", "funcion", "funcion_nombre", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]:
+    for c in ["periodo_novedad", "sap", "cargo_original", "funcion", "funcion_nombre", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]:
         if c not in out.columns:
             out[c] = ""
     out["cargo_reporte_original"] = out["cargo_original"].astype(str)
@@ -1231,6 +1251,31 @@ def apply_maestro_posicion_funcion(df: pd.DataFrame, maestro: pd.DataFrame, hom=
         for c in ["periodo_novedad", "posicion_key", "funcion", "funcion_nombre", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]:
             if c not in m.columns:
                 m[c] = ""
+        # V10: primer intento por SAP + período cuando la fuente lo trae (ej. provisión IdentificacionEmpleado).
+        # Esto NO agrupa por SAP: solo usa SAP para recuperar la función/posición del período desde HC.
+        out["_found_sap"] = False
+        if "sap" in out.columns and "sap" in m.columns:
+            m_sap = m.copy()
+            m_sap["sap"] = m_sap["sap"].map(clean_code)
+            m_sap = m_sap[m_sap["sap"].astype(str).str.strip().ne("")].drop_duplicates(["periodo_novedad", "sap"], keep="first")
+            if not m_sap.empty:
+                m_sap2 = m_sap[["periodo_novedad", "sap", "funcion", "funcion_nombre", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]].rename(columns={
+                    "funcion": "funcion_sap",
+                    "funcion_nombre": "funcion_nombre_sap",
+                    "cargo_homologado": "cargo_homologado_sap",
+                    "area_negocio": "area_negocio_sap",
+                    "ceco": "ceco_sap",
+                    "area_nomina": "area_nomina_sap",
+                })
+                out["sap"] = out["sap"].map(clean_code)
+                out = out.merge(m_sap2, on=["periodo_novedad", "sap"], how="left")
+                found_sap = has_text_series(out.get("funcion_nombre_sap", pd.Series([np.nan] * len(out))))
+                for base_col in ["funcion", "funcion_nombre", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]:
+                    scol = f"{base_col}_sap"
+                    if scol in out.columns:
+                        out[base_col] = np.where(found_sap, out[scol], out[base_col])
+                out["_found_sap"] = found_sap
+
         m = m.drop_duplicates(["periodo_novedad", "posicion_key"], keep="first")
         m2 = m[["periodo_novedad", "posicion_key", "funcion", "funcion_nombre", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]].copy()
         m2 = m2.rename(columns={
@@ -1243,7 +1288,7 @@ def apply_maestro_posicion_funcion(df: pd.DataFrame, maestro: pd.DataFrame, hom=
         })
         out = out.merge(m2, left_on=["periodo_novedad", "cargo_key_src"], right_on=["periodo_novedad", "posicion_key"], how="left")
         # Fallback global: si la posición existe en otro Headcount cargado, usarla.
-        missing = out["funcion_nombre_hc"].isna() | out["funcion_nombre_hc"].astype(str).str.strip().eq("")
+        missing = (~out.get("_found_sap", pd.Series([False] * len(out)))) & (~has_text_series(out.get("funcion_nombre_hc", pd.Series([np.nan] * len(out)))))
         if missing.any():
             mg = m.sort_values("periodo_novedad").drop_duplicates(["posicion_key"], keep="last")
             mg = mg[["posicion_key", "funcion", "funcion_nombre", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]].rename(columns={
@@ -1265,10 +1310,12 @@ def apply_maestro_posicion_funcion(df: pd.DataFrame, maestro: pd.DataFrame, hom=
                 out[f"{base_col}_hc_g"] = np.nan
 
         # Aplica función encontrada por período o global.
-        found_period = out["funcion_nombre_hc"].notna() & out["funcion_nombre_hc"].astype(str).str.strip().ne("")
-        found_global = (~found_period) & out.get("funcion_nombre_hc_g", pd.Series([np.nan]*len(out))).notna() & out.get("funcion_nombre_hc_g", pd.Series([""]*len(out))).astype(str).str.strip().ne("")
+        found_sap = out.get("_found_sap", pd.Series([False] * len(out))).astype(bool)
+        found_period = (~found_sap) & has_text_series(out.get("funcion_nombre_hc", pd.Series([np.nan]*len(out))))
+        found_global = (~found_sap) & (~found_period) & has_text_series(out.get("funcion_nombre_hc_g", pd.Series([np.nan]*len(out))))
         out["funcion"] = np.select([found_period, found_global], [out.get("funcion_hc", ""), out.get("funcion_hc_g", "")], default=out["funcion"])
-        out["funcion_nombre"] = np.select([found_period, found_global], [out.get("funcion_nombre_hc", ""), out.get("funcion_nombre_hc_g", "")], default=np.where(out["funcion_nombre"].astype(str).str.strip().ne(""), out["funcion_nombre"], out["cargo_original"]))
+        fn_actual_ok = has_text_series(out["funcion_nombre"])
+        out["funcion_nombre"] = np.select([found_period, found_global], [out.get("funcion_nombre_hc", ""), out.get("funcion_nombre_hc_g", "")], default=np.where(fn_actual_ok, out["funcion_nombre"], out["cargo_original"]))
         # Cargo original para el comparativo pasa a ser la función ya normalizada.
         out["cargo_original"] = out["funcion_nombre"]
         homol = [homologar_cargo(fun, fn, hom) for fun, fn in zip(out["funcion"], out["funcion_nombre"])]
@@ -1279,11 +1326,11 @@ def apply_maestro_posicion_funcion(df: pd.DataFrame, maestro: pd.DataFrame, hom=
         out["area_negocio"] = np.where(area_src_bad & found_period, out.get("area_negocio_hc", out["area_negocio"]), out["area_negocio"])
         out["area_negocio"] = np.where(area_src_bad & found_global, out.get("area_negocio_hc_g", out["area_negocio"]), out["area_negocio"])
         out["metodo_homologacion"] = np.select(
-            [found_period, found_global],
-            ["Posición/Cargo fuente → Headcount del período → Función", "Posición/Cargo fuente → Headcount consolidado → Función"],
+            [found_sap, found_period, found_global],
+            ["SAP fuente → Headcount del período → Función", "Posición/Cargo fuente → Headcount del período → Función", "Posición/Cargo fuente → Headcount consolidado → Función"],
             default="Sin cruce en Headcount; función/cargo original"
         )
-        drop_aux = [c for c in out.columns if c.endswith("_hc") or c.endswith("_hc_g") or c in ["posicion_key", "posicion_key_x", "posicion_key_y", "cargo_key_src", "funcion_key_src"]]
+        drop_aux = [c for c in out.columns if c.endswith("_hc") or c.endswith("_hc_g") or c.endswith("_sap") or c in ["posicion_key", "posicion_key_x", "posicion_key_y", "cargo_key_src", "funcion_key_src", "_found_sap"]]
         out = out.drop(columns=drop_aux, errors="ignore")
     else:
         out["funcion_nombre"] = np.where(out["funcion_nombre"].astype(str).str.strip().ne(""), out["funcion_nombre"], out["cargo_original"])
