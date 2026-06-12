@@ -29,7 +29,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_VERSION = "V14.4 - Corrección HC por periodo + Provisión streaming + Predicción financiera"
+APP_VERSION = "V14.5 - Filtros seguros + HC por periodo + Provisión streaming + Predicción financiera"
 ORANGE = "#F26A21"
 BLUE = "#005AA9"
 GREEN = "#2E8B57"
@@ -1330,25 +1330,87 @@ def pretty_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def display_df(df: pd.DataFrame, name: str = "tabla", max_rows: int = MAX_SCREEN_ROWS):
-    if df is None or df.empty:
-        st.info("No hay datos para mostrar.")
-        return
-    total = len(df)
-    show = df.head(max_rows).copy()
-    if total > max_rows:
-        st.warning(f"Se muestran las primeras {max_rows:,} filas de {total:,}. Descarga el Excel para revisar el detalle completo.")
-    height = min(650, max(240, 38 * (len(show) + 1)))
-    st.dataframe(pretty_df(show), width="stretch", height=int(height))
+    """Muestra tablas sin tumbar la app.
+
+    Protecciones V14.5:
+    - Limita filas en pantalla.
+    - Elimina columnas duplicadas.
+    - Evita errores de Arrow/Streamlit por tipos mixtos.
+    - Si st.dataframe falla, muestra una tabla HTML simple y mantiene la app viva.
+    """
+    try:
+        if df is None or len(df) == 0:
+            st.info("No hay datos para mostrar con los filtros seleccionados.")
+            return
+        safe = df.copy()
+        safe = safe.loc[:, ~safe.columns.duplicated()].copy()
+        safe = safe.replace([np.inf, -np.inf], np.nan)
+        total = len(safe)
+        show = safe.head(max_rows).copy()
+        if total > max_rows:
+            st.warning(f"Se muestran las primeras {max_rows:,} filas de {total:,}. Descarga el Excel para revisar el detalle completo.")
+        height = min(650, max(240, 38 * (len(show) + 1)))
+        try:
+            shown = pretty_df(show)
+            shown = shown.loc[:, ~shown.columns.duplicated()].copy()
+            st.dataframe(shown, width="stretch", height=int(height))
+        except Exception as e:
+            st.warning(f"La tabla se mostró en modo seguro porque Streamlit no pudo renderizarla normalmente: {type(e).__name__}")
+            fallback = pretty_df(show).astype(str)
+            st.dataframe(fallback, width="stretch", height=int(height))
+    except Exception as e:
+        st.error("No fue posible mostrar esta tabla, pero la app continúa funcionando.")
+        st.caption(f"Detalle técnico: {type(e).__name__}: {e}")
 
 
 def filter_df(df: pd.DataFrame, filters: Dict[str, List[str]]) -> pd.DataFrame:
-    if df is None or df.empty:
+    """Filtrado defensivo: nunca debe tumbar la app."""
+    try:
+        if df is None or len(df) == 0:
+            return pd.DataFrame()
+        out = df.copy()
+        out = out.loc[:, ~out.columns.duplicated()].copy()
+        for col, vals in filters.items():
+            if vals and col in out.columns:
+                vals_set = {str(v) for v in vals}
+                out = out[out[col].astype(str).isin(vals_set)]
+        return out
+    except Exception as e:
+        st.error("No fue posible aplicar los filtros. Se devuelve la base sin filtrar para no tumbar la app.")
+        st.caption(f"Detalle técnico: {type(e).__name__}: {e}")
+        return df.copy() if df is not None else pd.DataFrame()
+
+
+def prepare_report_base(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza la base para filtros y evita errores por columnas/tipos."""
+    if df is None or len(df) == 0:
         return pd.DataFrame()
     out = df.copy()
-    for col, vals in filters.items():
-        if vals and col in out.columns:
-            out = out[out[col].astype(str).isin(vals)]
+    out = out.loc[:, ~out.columns.duplicated()].copy()
+    for c in ["periodo_novedad", "area_negocio", "cargo_homologado", "concepto", "tipo_hora"]:
+        if c not in out.columns:
+            out[c] = ""
+        out[c] = out[c].fillna("").astype(str)
+    numeric_cols = [
+        "cantidad_pagada", "valor_pagado", "cantidad_provisionada", "valor_provisionado",
+        "cantidad_proyectada", "valor_proyectado", "hc", "dif_pagado_vs_provision",
+        "dif_pagado_vs_proyeccion", "dif_cant_pagada_vs_provision", "dif_cant_pagada_vs_proyeccion",
+        "desv_pct_vs_provision", "desv_pct_vs_proyeccion"
+    ]
+    for c in numeric_cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c].apply(parse_number), errors="coerce").fillna(0.0)
+    out["periodo_novedad"] = out["periodo_novedad"].apply(normalize_period_value)
     return out
+
+
+def safe_unique_options(df: pd.DataFrame, col: str, sort_period: bool = False) -> List[str]:
+    if df is None or df.empty or col not in df.columns:
+        return []
+    vals = [v for v in df[col].fillna("").astype(str).unique().tolist() if v != ""]
+    if sort_period:
+        return sorted(vals, key=period_sort_key)
+    return sorted(vals)
 
 
 def make_excel(report: Dict[str, pd.DataFrame], extras: Dict[str, pd.DataFrame]) -> bytes:
@@ -2261,32 +2323,45 @@ elif page == "2. Cargar paquete y comparar":
         cols[1].metric("Provisión", format_money(total_prov))
         cols[2].metric("Proyección", format_money(total_proy))
         cols[3].metric("Dif. pagado vs provisión", format_money(total_pagado - total_prov))
-        base = report.get("Resumen_Ejecutivo_Sin_Ceros", pd.DataFrame()).copy()
+        base = prepare_report_base(report.get("Resumen_Ejecutivo_Sin_Ceros", pd.DataFrame()))
         if base.empty:
             st.warning("No hay datos en Resumen Ejecutivo. Revisa alertas y paquete generado.")
         else:
             with st.form("filtros_comparativo_v12"):
                 st.markdown("#### Filtros — vacío = todos")
                 fcols = st.columns(5)
-                meses = sorted(base["periodo_novedad"].dropna().astype(str).unique(), key=period_sort_key) if "periodo_novedad" in base.columns else []
-                areas = sorted(base["area_negocio"].dropna().astype(str).unique()) if "area_negocio" in base.columns else []
-                cargos = sorted(base["cargo_homologado"].dropna().astype(str).unique()) if "cargo_homologado" in base.columns else []
-                conceptos = sorted(base["concepto"].dropna().astype(str).unique()) if "concepto" in base.columns else []
-                tipos = sorted(base["tipo_hora"].dropna().astype(str).unique()) if "tipo_hora" in base.columns else []
+                meses = safe_unique_options(base, "periodo_novedad", sort_period=True)
+                areas = safe_unique_options(base, "area_negocio")
+                cargos = safe_unique_options(base, "cargo_homologado")
+                conceptos = safe_unique_options(base, "concepto")
+                tipos = safe_unique_options(base, "tipo_hora")
                 sel_m = fcols[0].multiselect("Mes novedad", meses, default=[])
                 sel_a = fcols[1].multiselect("Área negocio", areas, default=[])
                 sel_c = fcols[2].multiselect("Cargo homologado", cargos, default=[])
                 sel_con = fcols[3].multiselect("Concepto", conceptos, default=[])
                 sel_t = fcols[4].multiselect("Tipo hora", tipos, default=[])
                 aplicar = st.form_submit_button("Aplicar filtros", type="primary")
-            filt = base.copy()
-            if sel_m: filt = filt[filt["periodo_novedad"].astype(str).isin(sel_m)]
-            if sel_a: filt = filt[filt["area_negocio"].astype(str).isin(sel_a)]
-            if sel_c: filt = filt[filt["cargo_homologado"].astype(str).isin(sel_c)]
-            if sel_con: filt = filt[filt["concepto"].astype(str).isin(sel_con)]
-            if sel_t: filt = filt[filt["tipo_hora"].astype(str).isin(sel_t)]
+            with st.spinner("Aplicando filtros en modo seguro..."):
+                filt = filter_df(base, {
+                    "periodo_novedad": sel_m,
+                    "area_negocio": sel_a,
+                    "cargo_homologado": sel_c,
+                    "concepto": sel_con,
+                    "tipo_hora": sel_t,
+                })
             st.markdown("### Resumen ejecutivo filtrado")
-            display_df(filt)
+            if filt.empty:
+                st.info("No hay registros para los filtros seleccionados. Limpia algún filtro o selecciona otra combinación.")
+            else:
+                total_f_pagado = filt["valor_pagado"].sum() if "valor_pagado" in filt.columns else 0
+                total_f_prov = filt["valor_provisionado"].sum() if "valor_provisionado" in filt.columns else 0
+                total_f_proy = filt["valor_proyectado"].sum() if "valor_proyectado" in filt.columns else 0
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Pagado filtrado", format_money(total_f_pagado))
+                m2.metric("Provisión filtrada", format_money(total_f_prov))
+                m3.metric("Proyección filtrada", format_money(total_f_proy))
+                m4.metric("Dif. vs provisión", format_money(total_f_pagado-total_f_prov))
+                display_df(filt)
             tab1, tab2, tab3, tab4 = st.tabs(["Resumen por mes", "Resumen por cargo", "Indicadores HC", "Descargar"])
             with tab1:
                 display_df(report.get("Resumen_Mes", pd.DataFrame()))
