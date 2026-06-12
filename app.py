@@ -618,19 +618,72 @@ def qty_fmt(v) -> str:
         return "0,00"
 
 
-def dataframe_config(df: pd.DataFrame) -> Dict:
-    cfg = {}
+FRIENDLY_COLUMNS = {
+    "periodo_novedad": "Mes novedad",
+    "periodo_pago": "Mes pago",
+    "concepto": "Concepto",
+    "tipo_hora": "Tipo hora",
+    "cargo_homologado": "Cargo homologado",
+    "area_negocio": "Área negocio",
+    "ceco": "CECO",
+    "hc": "HC",
+    "valor_pagado": "Valor pagado",
+    "valor_provisionado": "Valor provisión",
+    "valor_proyectado": "Valor proyección",
+    "cantidad_pagada": "Cantidad pagada",
+    "cantidad_provisionada": "Cantidad provisión",
+    "cantidad_proyectada": "Cantidad proyección",
+    "dif_valor_pagado_vs_provision": "Dif. pagado vs provisión",
+    "dif_valor_pagado_vs_proyeccion": "Dif. pagado vs proyección",
+    "dif_cant_pagada_vs_provision": "Dif. cant. pagada vs provisión",
+    "dif_cant_pagada_vs_proyeccion": "Dif. cant. pagada vs proyección",
+    "pct_desv_provision": "% desv. provisión",
+    "pct_desv_proyeccion": "% desv. proyección",
+    "valor_estimado": "Valor estimado",
+    "cantidad_estimada": "Cantidad estimada",
+    "valor_hora_ref": "Valor hora ref.",
+    "salario": "Salario",
+    "salario_total": "Salario total",
+    "metodo_homologacion": "Método homologación",
+    "cargo_original": "Cargo/función original",
+    "posicion_original": "Posición original",
+    "funcion_nombre": "Función período",
+}
+
+def _is_money_col(c: str) -> bool:
+    cl = norm_text(c)
+    return any(x in cl for x in ["VALOR", "IMPORTE", "PROVISION", "PROYECCION", "PAGADO", "DIF", "COSTO", "SALARIO", "CUENTA"]) and not any(x in cl for x in ["CANT", "CANTIDAD", "PCT", "PORC"] )
+
+def _is_qty_col(c: str) -> bool:
+    cl = norm_text(c)
+    return any(x in cl for x in ["CANTIDAD", "CANT", "HORAS", "Q", "HC"]) and not _is_money_col(c)
+
+def _is_pct_col(c: str) -> bool:
+    cl = norm_text(c)
+    return "PCT" in cl or "DESV" in cl or "PORC" in cl or cl.startswith("%")
+
+def pretty_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Devuelve una copia lista para visualización: pesos con miles, cantidades con 2 decimales y encabezados amigables."""
     if df is None or df.empty:
-        return cfg
-    for c in df.columns:
-        cl = norm_text(c)
-        if any(x in cl for x in ["VALOR", "IMPORTE", "PROVISION", "PROYECCION", "PAGADO", "DIF", "COSTO", "SALARIO"]):
-            cfg[c] = st.column_config.NumberColumn(c, format="$ %d")
-        elif any(x in cl for x in ["CANTIDAD", "CANT", "HORAS", "Q"]):
-            cfg[c] = st.column_config.NumberColumn(c, format="%.2f")
-        elif "PCT" in cl or "DESV" in cl or "PORC" in cl:
-            cfg[c] = st.column_config.NumberColumn(c, format="%.2f")
-    return cfg
+        return df
+    out = df.copy()
+    for c in out.columns:
+        if pd.api.types.is_numeric_dtype(out[c]):
+            if _is_pct_col(c):
+                out[c] = out[c].map(lambda x: "" if pd.isna(x) else f"{float(x)*100:,.2f}%".replace(",", "X").replace(".", ",").replace("X", "."))
+            elif _is_money_col(c):
+                out[c] = out[c].map(money_fmt)
+            elif _is_qty_col(c):
+                out[c] = out[c].map(qty_fmt)
+    out = out.rename(columns={c: FRIENDLY_COLUMNS.get(c, c) for c in out.columns})
+    return out
+
+def display_df(df: pd.DataFrame, height: Optional[int] = None):
+    st.dataframe(pretty_df(df), use_container_width=True, height=height)
+
+def dataframe_config(df: pd.DataFrame) -> Dict:
+    # Se mantiene por compatibilidad, pero las tablas principales usan pretty_df/display_df
+    return {}
 
 # =============================================================
 # LECTURA / NORMALIZACIÓN DE INSUMOS
@@ -748,10 +801,29 @@ def process_compensatorios(files, hom) -> Tuple[pd.DataFrame, List[str]]:
     return (pd.concat(cc_rows, ignore_index=True) if cc_rows else pd.DataFrame()), alerts
 
 
-def process_provision(files, hom) -> Tuple[pd.DataFrame, List[str]]:
+def process_provision(files, hom, md_periodo=None) -> Tuple[pd.DataFrame, List[str]]:
     alerts, rows = [], []
     if not files:
         return pd.DataFrame(), ["No se cargó provisión."]
+
+    # Lookup por período + posición/texto de cargo desde Headcount/MD del período.
+    # Sirve para bases sin SAP: si el reporte trae nombre de posición, primero buscamos
+    # esa posición en el Headcount del mes para recuperar la función real y luego homologar.
+    pos_lookup = pd.DataFrame()
+    if md_periodo is not None and not md_periodo.empty and "periodo_novedad" in md_periodo.columns:
+        tmp_lu = md_periodo.copy()
+        if "posicion_original" in tmp_lu.columns:
+            tmp_lu["posicion_key"] = tmp_lu["posicion_original"].map(norm_text)
+        else:
+            tmp_lu["posicion_key"] = ""
+        if "cargo_original" in tmp_lu.columns:
+            tmp_lu["cargo_key"] = tmp_lu["cargo_original"].map(norm_text)
+        else:
+            tmp_lu["cargo_key"] = ""
+        keep = [c for c in ["periodo_novedad", "posicion_key", "cargo_key", "funcion", "funcion_nombre", "cargo_original", "cargo_homologado", "area_negocio", "ceco", "area_nomina"] if c in tmp_lu.columns]
+        pos_lookup = tmp_lu[keep].copy()
+        pos_lookup = pos_lookup.drop_duplicates(["periodo_novedad", "posicion_key"], keep="last")
+
     for f in files:
         name = uploaded_name(f)
         try:
@@ -781,10 +853,36 @@ def process_provision(files, hom) -> Tuple[pd.DataFrame, List[str]]:
             out["ceco"] = df.loc[idx, col_ceco].map(clean_ceco).values if col_ceco else ""
             tipo_vals = df.loc[idx, col_tipo].astype(str).values if col_tipo else [""] * len(out)
             out["cargo_original"] = df.loc[idx, col_cargo].astype(str).values if col_cargo else ""
-            homol = [homologar_cargo(None, car, hom) for car in out["cargo_original"]]
+            out["cargo_key"] = out["cargo_original"].map(norm_text)
+            out["metodo_homologacion"] = "Cargo/función provisión"
+            if not pos_lookup.empty:
+                lu_pos = pos_lookup.rename(columns={"posicion_key": "cargo_key"})
+                out = out.merge(lu_pos, on=["periodo_novedad", "cargo_key"], how="left", suffixes=("", "_hc"))
+                tiene_hc = out.get("cargo_homologado", pd.Series([np.nan]*len(out))).notna()
+                # Si no encontró por posición, intenta por función/cargo exacto del Headcount.
+                if "cargo_homologado" in out.columns and (~tiene_hc).any():
+                    missing = out.loc[~tiene_hc].drop(columns=[c for c in ["funcion", "funcion_nombre", "cargo_homologado", "area_negocio_hc", "ceco_hc", "area_nomina"] if c in out.columns], errors="ignore")
+                out["cargo_original_hc"] = out.get("cargo_original_hc", out.get("cargo_original", ""))
+                out["cargo_para_homologar"] = np.where(tiene_hc, out.get("cargo_original_hc", out["cargo_original"]), out["cargo_original"])
+                out["funcion_para_homologar"] = np.where(tiene_hc, out.get("funcion", ""), "")
+                ceco_hc_col = "ceco_hc" if "ceco_hc" in out.columns else "ceco"
+                area_hc_col = "area_negocio_hc" if "area_negocio_hc" in out.columns else ("area_negocio" if "area_negocio" in out.columns else None)
+                out["ceco"] = np.where(tiene_hc & out[ceco_hc_col].astype(str).str.strip().ne(""), out[ceco_hc_col], out["ceco"])
+                if area_hc_col:
+                    out["area_negocio_pre"] = np.where(tiene_hc & out[area_hc_col].astype(str).str.strip().ne(""), out[area_hc_col], "")
+                else:
+                    out["area_negocio_pre"] = ""
+                out["metodo_homologacion"] = np.where(tiene_hc, "Posición provisión + Headcount período → Función", "Cargo/función provisión")
+            else:
+                out["cargo_para_homologar"] = out["cargo_original"]
+                out["funcion_para_homologar"] = ""
+                out["area_negocio_pre"] = ""
+            homol = [homologar_cargo(fun, car, hom) for fun, car in zip(out["funcion_para_homologar"], out["cargo_para_homologar"])]
             out["cargo_homologado"] = [x[0] for x in homol]
             out["cargo_homologado_ok"] = [x[1] for x in homol]
-            out["area_negocio"] = [classify_area(c, t, None, None, None) for c, t in zip(out["ceco"], tipo_vals)]
+            out["area_negocio"] = np.where(out["area_negocio_pre"].astype(str).str.strip().ne(""), out["area_negocio_pre"], [classify_area(c, t, None, None, None) for c, t in zip(out["ceco"], tipo_vals)])
+            drop_cols = ["cargo_key", "cargo_para_homologar", "funcion_para_homologar", "area_negocio_pre"]
+            out = out.drop(columns=[c for c in drop_cols if c in out.columns])
             rows.append(out)
         except Exception as e:
             alerts.append(f"Error procesando provisión {name}: {e}")
@@ -805,12 +903,20 @@ def process_proyeccion(files, hom, md_periodo=None) -> Tuple[pd.DataFrame, List[
         return pd.DataFrame(), ["No se cargó proyección."]
 
     md_lookup = pd.DataFrame()
+    pos_lookup = pd.DataFrame()
     if md_periodo is not None and not md_periodo.empty:
-        cols = [c for c in ["periodo_novedad", "sap", "funcion", "cargo_original", "cargo_homologado", "area_negocio", "ceco", "area_nomina"] if c in md_periodo.columns]
+        cols = [c for c in ["periodo_novedad", "sap", "funcion", "funcion_nombre", "posicion_original", "cargo_original", "cargo_homologado", "area_negocio", "ceco", "area_nomina"] if c in md_periodo.columns]
         md_lookup = md_periodo[cols].copy()
         if "sap" in md_lookup.columns:
             md_lookup["sap"] = md_lookup["sap"].map(clean_code)
         md_lookup = md_lookup.drop_duplicates(["periodo_novedad", "sap"], keep="last") if {"periodo_novedad", "sap"}.issubset(md_lookup.columns) else pd.DataFrame()
+
+        # Lookup adicional por texto de posición/cargo del reporte contra Headcount del mismo período.
+        pos_lookup = md_periodo.copy()
+        pos_lookup["posicion_key"] = pos_lookup["posicion_original"].map(norm_text) if "posicion_original" in pos_lookup.columns else ""
+        keep_pos = [c for c in ["periodo_novedad", "posicion_key", "funcion", "funcion_nombre", "cargo_original", "cargo_homologado", "area_negocio", "ceco", "area_nomina"] if c in pos_lookup.columns]
+        pos_lookup = pos_lookup[keep_pos].copy()
+        pos_lookup = pos_lookup[pos_lookup["posicion_key"].astype(str).str.strip().ne("")].drop_duplicates(["periodo_novedad", "posicion_key"], keep="last") if {"periodo_novedad", "posicion_key"}.issubset(pos_lookup.columns) else pd.DataFrame()
 
     for f in files:
         name = uploaded_name(f)
@@ -848,25 +954,60 @@ def process_proyeccion(files, hom, md_periodo=None) -> Tuple[pd.DataFrame, List[
                 base["area_nomina"] = np.nan
                 base["tiene_md_periodo"] = False
 
-            # Fallback cuando SAP es Error/vacío/no cruza: usar Función/Cargo de la proyección.
-            base["cargo_para_homologar"] = np.where(base["tiene_md_periodo"], base.get("cargo_original", ""), base["cargo_original_base"])
-            base["funcion_para_homologar"] = np.where(base["tiene_md_periodo"], base.get("funcion", ""), "")
+            # Fallback 1 cuando SAP es Error/vacío/no cruza: validar si el texto de la proyección
+            # existe como posición en el Headcount del mismo período. Si existe, se toma la función
+            # de ese Headcount y solo después se homologa.
+            base["posicion_key"] = base["cargo_original_base"].map(norm_text)
+            if not pos_lookup.empty:
+                base = base.merge(pos_lookup.rename(columns={
+                    "funcion": "funcion_pos",
+                    "funcion_nombre": "funcion_nombre_pos",
+                    "cargo_original": "cargo_original_pos",
+                    "cargo_homologado": "cargo_homologado_pos",
+                    "area_negocio": "area_negocio_pos",
+                    "ceco": "ceco_pos",
+                    "area_nomina": "area_nomina_pos",
+                }), on=["periodo_novedad", "posicion_key"], how="left")
+                base["tiene_pos_periodo"] = base["cargo_homologado_pos"].notna() & (~base["tiene_md_periodo"])
+            else:
+                base["tiene_pos_periodo"] = False
+                for c in ["funcion_pos", "cargo_original_pos", "cargo_homologado_pos", "area_negocio_pos", "ceco_pos", "area_nomina_pos"]:
+                    base[c] = np.nan
+
+            base["cargo_para_homologar"] = np.select(
+                [base["tiene_md_periodo"], base["tiene_pos_periodo"]],
+                [base.get("cargo_original", ""), base.get("cargo_original_pos", "")],
+                default=base["cargo_original_base"]
+            )
+            base["funcion_para_homologar"] = np.select(
+                [base["tiene_md_periodo"], base["tiene_pos_periodo"]],
+                [base.get("funcion", ""), base.get("funcion_pos", "")],
+                default=""
+            )
             fallback_hom = [homologar_cargo(fun, car, hom) for fun, car in zip(base["funcion_para_homologar"], base["cargo_para_homologar"])]
             base["cargo_homologado_calc"] = [x[0] for x in fallback_hom]
             base["cargo_homologado_ok_calc"] = [x[1] for x in fallback_hom]
             base["cargo_homologado_final"] = np.where(base["tiene_md_periodo"], base["cargo_homologado"], base["cargo_homologado_calc"])
             base["cargo_homologado_ok_final"] = np.where(base["tiene_md_periodo"], True, base["cargo_homologado_ok_calc"])
-            base["ceco_final"] = np.where(base["tiene_md_periodo"], base["ceco"].fillna(""), base["ceco_origen"])
-            base["area_nomina_final"] = np.where(base["tiene_md_periodo"], base.get("area_nomina", "").fillna(""), base["area_nomina_origen"])
-            base["area_negocio_final"] = np.where(
-                base["tiene_md_periodo"],
-                base["area_negocio"].fillna("Sin clasificar"),
-                [classify_area(c, t, None, a, None) for c, t, a in zip(base["ceco_origen"], base["tipo_origen"], base["area_nomina_origen"])]
+            base["ceco_final"] = np.select(
+                [base["tiene_md_periodo"], base["tiene_pos_periodo"]],
+                [base["ceco"].fillna(""), base.get("ceco_pos", "").fillna("")],
+                default=base["ceco_origen"]
             )
-            base["metodo_homologacion"] = np.where(
-                base["tiene_md_periodo"],
-                "SAP + Headcount/MD del periodo",
-                np.where(base["sap_valido"], "Función/Cargo proyección (SAP no cruzó)", "Función/Cargo proyección (SAP inválido/Error)")
+            base["area_nomina_final"] = np.select(
+                [base["tiene_md_periodo"], base["tiene_pos_periodo"]],
+                [base.get("area_nomina", "").fillna(""), base.get("area_nomina_pos", "").fillna("")],
+                default=base["area_nomina_origen"]
+            )
+            base["area_negocio_final"] = np.select(
+                [base["tiene_md_periodo"], base["tiene_pos_periodo"]],
+                [base["area_negocio"].fillna("Sin clasificar"), base.get("area_negocio_pos", "").fillna("Sin clasificar")],
+                default=[classify_area(c, t, None, a, None) for c, t, a in zip(base["ceco_origen"], base["tipo_origen"], base["area_nomina_origen"])]
+            )
+            base["metodo_homologacion"] = np.select(
+                [base["tiene_md_periodo"], base["tiene_pos_periodo"], base["sap_valido"]],
+                ["SAP + Headcount/MD del período", "Posición proyección + Headcount período → Función", "Función/Cargo proyección (SAP no cruzó)"],
+                default="Función/Cargo proyección (SAP inválido/Error)"
             )
 
             for concepto in CONCEPTOS:
@@ -918,8 +1059,14 @@ def process_headcount(files, hom) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFr
             col_sap = find_col(df, ["Nº pers.", "N° pers.", "SAP", "Número de personal"], required=True)
             col_status = find_col(df, ["Status ocupación", "Status ocupacion", "Estado"], required=False)
             col_ceco = find_col(df, ["Ce.coste", "CECO"], required=False)
+            # En Headcount SAP suele traer código y texto duplicados:
+            # Posición / Posición.1 y Función / Función.1.
+            # Para homologar correctamente no usamos el texto de posición como cargo final;
+            # lo usamos como llave para encontrar la función del período.
             col_func = find_col(df, ["Función", "Funcion"], required=False)
-            col_cargo = find_col(df, ["Función.1", "Funcion.1", "Posición.1", "Posicion.1", "Cargo"], required=False)
+            col_func_name = find_col(df, ["Función.1", "Funcion.1", "Denominación función", "Denominacion funcion"], required=False)
+            col_pos_name = find_col(df, ["Posición.1", "Posicion.1", "Denominación posición", "Denominacion posicion", "Posición", "Posicion"], required=False)
+            col_cargo = col_func_name or col_pos_name
             col_area_nom = find_col(df, ["Área de nómina", "Area de nomina"], required=False)
             col_div = find_col(df, ["División de personal", "Division de personal"], required=False)
             col_area_pers = find_col(df, ["Área de personal", "Area de personal"], required=False)
@@ -942,7 +1089,10 @@ def process_headcount(files, hom) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFr
             out["sap"] = work[col_sap].map(clean_code)
             out["ceco"] = work[col_ceco].map(clean_ceco) if col_ceco else ""
             out["funcion"] = work[col_func].map(clean_code) if col_func else ""
-            out["cargo_original"] = work[col_cargo].astype(str) if col_cargo else ""
+            out["funcion_nombre"] = work[col_func_name].astype(str) if col_func_name else ""
+            out["posicion_original"] = work[col_pos_name].astype(str) if col_pos_name else ""
+            # Cargo final para homologar = función del período. La posición queda solo como llave/auditoría.
+            out["cargo_original"] = np.where(out["funcion_nombre"].astype(str).str.strip().ne(""), out["funcion_nombre"], out["posicion_original"])
             out["area_nomina"] = work[col_area_nom].astype(str) if col_area_nom else ""
             div_vals = work[col_div].astype(str).values if col_div else [""] * len(out)
             homol = [homologar_cargo(fun, car, hom) for fun, car in zip(out["funcion"], out["cargo_original"])]
@@ -1700,13 +1850,13 @@ if menu == "1. Cargue y procesamiento":
         comp_df, alerts = process_compensatorios(comp_files, hom)
         all_alerts += alerts
         pagado_df = pd.concat([x for x in [cc_df, comp_df] if x is not None and not x.empty], ignore_index=True) if ((cc_df is not None and not cc_df.empty) or (comp_df is not None and not comp_df.empty)) else pd.DataFrame()
-        progress.progress(45, text="Procesando provisión...")
-        provision_df, alerts = process_provision(prov_files, hom)
-        all_alerts += alerts
-        progress.progress(60, text="Procesando Headcount y maestro de cargos por periodo...")
+        progress.progress(45, text="Procesando Headcount y maestro de cargos por período...")
         hc_df, excl_hc, hc_detail, alerts = process_headcount(hc_files, hom)
         all_alerts += alerts
-        progress.progress(75, text="Procesando proyección con homologación por SAP/periodo o Función...")
+        progress.progress(60, text="Procesando provisión con homologación por posición del período...")
+        provision_df, alerts = process_provision(prov_files, hom, hc_detail)
+        all_alerts += alerts
+        progress.progress(75, text="Procesando proyección con SAP/posición del período o Función...")
         proyeccion_df, alerts = process_proyeccion(proy_files, hom, hc_detail)
         all_alerts += alerts
         progress.progress(90, text="Construyendo comparativo...")
@@ -1738,7 +1888,7 @@ if menu == "1. Cargue y procesamiento":
         m4.metric("Llaves comparativo", f"{len(comparativo):,.0f}")
 
         with st.expander("Ver alertas de procesamiento", expanded=True):
-            st.dataframe(alertas_df, use_container_width=True)
+            display_df(alertas_df)
 
 elif menu == "2. Comparativo histórico":
     st.subheader("2. Comparativo histórico")
@@ -1796,9 +1946,9 @@ elif menu == "2. Comparativo histórico":
     tab1, tab2, tab3, tab4 = st.tabs(["Resumen", "Gráficas", "Detalle", "Alertas / Descargar"])
     with tab1:
         st.markdown("#### Resumen por mes")
-        st.dataframe(resumenes.get("Resumen_mes", pd.DataFrame()), use_container_width=True, column_config=dataframe_config(resumenes.get("Resumen_mes", pd.DataFrame())))
+        display_df(resumenes.get("Resumen_mes", pd.DataFrame()))
         st.markdown("#### Resumen por concepto")
-        st.dataframe(resumenes.get("Resumen_concepto", pd.DataFrame()), use_container_width=True, column_config=dataframe_config(resumenes.get("Resumen_concepto", pd.DataFrame())))
+        display_df(resumenes.get("Resumen_concepto", pd.DataFrame()))
     with tab2:
         rm = resumenes.get("Resumen_mes", pd.DataFrame())
         if not rm.empty:
@@ -1812,10 +1962,10 @@ elif menu == "2. Comparativo histórico":
             fig2 = px.bar(top, x="dif", y="cargo_homologado", orientation="h", title="Top cargos por desviación pagado vs provisión")
             st.plotly_chart(fig2, use_container_width=True)
     with tab3:
-        st.dataframe(filt, use_container_width=True, height=520, column_config=dataframe_config(filt))
+        display_df(filt, height=520)
     with tab4:
         alertas = st.session_state.get("alertas_comparativo_filtrado", build_alertas_comparativo(filt, [], threshold))
-        st.dataframe(alertas, use_container_width=True)
+        display_df(alertas)
         sheets = {"Comparativo_general": filt, **resumenes, "Alertas": alertas}
         if st.session_state.get("hom_df") is not None and not st.session_state.hom_df.empty:
             sheets["Homologacion_usada"] = st.session_state.hom_df
@@ -1918,15 +2068,15 @@ elif menu == "3. Predicción mes en curso":
         k4.metric("Filas sin cuenta", f"{pred['cuenta'].eq('Sin cuenta').sum():,.0f}")
         tab1, tab2, tab3, tab4 = st.tabs(["Resumen", "Por cuentas", "Detalle", "Alertas / Descargar"])
         with tab1:
-            st.dataframe(rpred, use_container_width=True, column_config=dataframe_config(rpred))
+            display_df(rpred)
             fig = px.bar(rpred.groupby(["concepto", "tipo_hora"], dropna=False).agg(valor_estimado=("valor_estimado", "sum")).reset_index(), x="concepto", y="valor_estimado", color="tipo_hora", title="Valor estimado por concepto")
             st.plotly_chart(fig, use_container_width=True)
         with tab2:
-            st.dataframe(rc, use_container_width=True, column_config=dataframe_config(rc))
+            display_df(rc)
         with tab3:
-            st.dataframe(pred, use_container_width=True, height=520, column_config=dataframe_config(pred))
+            display_df(pred, height=520)
         with tab4:
-            st.dataframe(ap, use_container_width=True)
+            display_df(ap)
             sheets = {
                 "Prediccion_detalle": pred,
                 "Prediccion_resumen": rpred,
