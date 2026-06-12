@@ -872,12 +872,31 @@ def process_provision(files, hom, md_periodo=None) -> Tuple[pd.DataFrame, List[s
             out["cargo_key"] = out["cargo_original"].map(norm_text)
             out["metodo_homologacion"] = "Cargo/función provisión"
             if not pos_lookup.empty:
-                lu_pos = pos_lookup.rename(columns={"posicion_key": "cargo_key"})
+                # V8.1.1: evitar columnas duplicadas (cargo_key) al renombrar posicion_key.
+                # Se hacen 2 intentos ordenados:
+                #   1) posición/cargo del reporte contra posición del Headcount del mismo período
+                #   2) posición/cargo del reporte contra función/cargo del Headcount del mismo período
+                lu_pos = pos_lookup.drop(columns=["cargo_key"], errors="ignore").rename(columns={"posicion_key": "cargo_key"})
+                lu_pos = lu_pos.loc[:, ~lu_pos.columns.duplicated()].copy()
+                out = out.loc[:, ~out.columns.duplicated()].copy()
                 out = out.merge(lu_pos, on=["periodo_novedad", "cargo_key"], how="left", suffixes=("", "_hc"))
+
                 tiene_hc = out.get("cargo_homologado", pd.Series([np.nan]*len(out))).notna()
-                # Si no encontró por posición, intenta por función/cargo exacto del Headcount.
-                if "cargo_homologado" in out.columns and (~tiene_hc).any():
-                    missing = out.loc[~tiene_hc].drop(columns=[c for c in ["funcion", "funcion_nombre", "cargo_homologado", "area_negocio_hc", "ceco_hc", "area_nomina"] if c in out.columns], errors="ignore")
+
+                # Fallback: si no cruzó por posición, intenta por cargo/función del Headcount.
+                if (~tiene_hc).any() and "cargo_key" in pos_lookup.columns:
+                    lu_fun = pos_lookup.drop(columns=["posicion_key"], errors="ignore").copy()
+                    lu_fun = lu_fun.loc[:, ~lu_fun.columns.duplicated()].copy()
+                    lu_fun = lu_fun.drop_duplicates(["periodo_novedad", "cargo_key"], keep="last")
+                    missing_idx = out.index[~tiene_hc]
+                    base_missing = out.loc[missing_idx].drop(columns=[c for c in lu_fun.columns if c not in ["periodo_novedad", "cargo_key"]], errors="ignore")
+                    base_missing = base_missing.loc[:, ~base_missing.columns.duplicated()].copy()
+                    merged_missing = base_missing.merge(lu_fun, on=["periodo_novedad", "cargo_key"], how="left", suffixes=("", "_hc2"))
+                    for col in ["funcion", "funcion_nombre", "cargo_original", "cargo_homologado", "area_negocio", "ceco", "area_nomina"]:
+                        if col in merged_missing.columns:
+                            out.loc[missing_idx, col] = merged_missing[col].values
+                    tiene_hc = out.get("cargo_homologado", pd.Series([np.nan]*len(out))).notna()
+
                 out["cargo_original_hc"] = out.get("cargo_original_hc", out.get("cargo_original", ""))
                 out["cargo_para_homologar"] = np.where(tiene_hc, out.get("cargo_original_hc", out["cargo_original"]), out["cargo_original"])
                 out["funcion_para_homologar"] = np.where(tiene_hc, out.get("funcion", ""), "")
@@ -888,7 +907,7 @@ def process_provision(files, hom, md_periodo=None) -> Tuple[pd.DataFrame, List[s
                     out["area_negocio_pre"] = np.where(tiene_hc & out[area_hc_col].astype(str).str.strip().ne(""), out[area_hc_col], "")
                 else:
                     out["area_negocio_pre"] = ""
-                out["metodo_homologacion"] = np.where(tiene_hc, "Posición provisión + Headcount período → Función", "Cargo/función provisión")
+                out["metodo_homologacion"] = np.where(tiene_hc, "Posición/función provisión + Headcount período → Función", "Cargo/función provisión")
             else:
                 out["cargo_para_homologar"] = out["cargo_original"]
                 out["funcion_para_homologar"] = ""
@@ -1732,7 +1751,7 @@ def resumenes_comparativo(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     res_mes = agg_by(["periodo_novedad"], hc_mode="sum")
     res_concepto = agg_by(["periodo_novedad", "concepto", "tipo_hora"])
 
-    # V8: resumen gerencial sin CECO, con Área negocio + Cargo homologado + Concepto + Tipo hora.
+    # V8.1: resumen gerencial sin CECO, con Área negocio + Cargo homologado + Concepto + Tipo hora.
     resumen_ejecutivo = agg_by(["periodo_novedad", "area_negocio", "cargo_homologado", "concepto", "tipo_hora"])
     resumen_ejecutivo_sin_ceros = _sin_ceros(resumen_ejecutivo)
 
