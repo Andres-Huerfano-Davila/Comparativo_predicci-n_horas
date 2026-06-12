@@ -29,7 +29,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_VERSION = "V14.2 - Fix Headcount por periodo + Provisión streaming + Paquete homologado + Predicción financiera"
+APP_VERSION = "V14.3 - HC por conteo de posiciones homologadas por periodo + Provisión streaming + Predicción financiera"
 ORANGE = "#F26A21"
 BLUE = "#005AA9"
 GREEN = "#2E8B57"
@@ -649,6 +649,73 @@ def process_headcount(files: List[Any], concept_map: Dict[str, str], func_map: D
     if len(excl):
         alerts.append({"tipo":"Headcount", "mensaje":f"Headcount: se excluyeron {len(excl):,} registros Manager I-IV/no aplican horas"})
     return hc_full, hc_group, excl, alerts
+
+
+def finalize_headcount_with_master(hc_full: pd.DataFrame, master: Dict[str, Dict[str, str]], func_map: Dict[str, str]) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[Dict[str, Any]]]:
+    """Recalcula el HC usando la regla correcta:
+    periodo + posición del Headcount -> función -> cargo homologado.
+    El HC se cuenta después de homologar posiciones por periodo y excluyendo Manager I-IV.
+    """
+    alerts: List[Dict[str, Any]] = []
+    if hc_full is None or hc_full.empty:
+        return pd.DataFrame(), pd.DataFrame(columns=KEY_HC + ["hc"]), pd.DataFrame(), alerts
+
+    hc = drop_duplicated_columns(hc_full.copy())
+    for c in ["periodo_novedad", "sap", "posicion_codigo", "posicion_nombre", "funcion_codigo", "funcion_nombre", "area_negocio", "manager_excluido"]:
+        if c not in hc.columns:
+            hc[c] = ""
+
+    hc["periodo_novedad"] = hc.apply(lambda r: normalize_period_value(r.get("periodo_novedad", ""), r.get("archivo", "")), axis=1)
+    hc["sap"] = hc["sap"].apply(clean_sap)
+    hc["posicion_codigo"] = hc["posicion_codigo"].apply(clean_code)
+    hc["posicion_nombre"] = hc["posicion_nombre"].apply(clean_text)
+    hc["funcion_codigo"] = hc["funcion_codigo"].apply(clean_code)
+    hc["funcion_nombre"] = hc["funcion_nombre"].apply(clean_text)
+    hc["area_negocio"] = hc["area_negocio"].replace("", "Sin clasificar").fillna("Sin clasificar")
+
+    # Resolver función desde maestro de posiciones, con fallback a función propia del Headcount
+    resolved = []
+    for _, r in hc.iterrows():
+        fc, fn, origin = resolve_function_from_master(r.get("posicion_nombre", ""), master)
+        if not fn:
+            fc, fn, origin = resolve_function_from_master(r.get("posicion_codigo", ""), master)
+        if not fn:
+            fc = clean_code(r.get("funcion_codigo", ""))
+            fn = clean_text(r.get("funcion_nombre", ""))
+            origin = "funcion_headcount" if fn or fc else "sin_funcion"
+        cargo, metodo = homologate_function(fc, fn, func_map, r.get("area_negocio", ""))
+        resolved.append((fc, fn, origin, cargo, metodo))
+
+    if resolved:
+        hc[["funcion_codigo_final", "funcion_nombre_final", "origen_funcion", "cargo_homologado", "metodo_cargo"]] = pd.DataFrame(resolved, index=hc.index)
+    else:
+        hc["funcion_codigo_final"] = ""
+        hc["funcion_nombre_final"] = ""
+        hc["origen_funcion"] = ""
+        hc["cargo_homologado"] = "Sin homologar"
+        hc["metodo_cargo"] = ""
+
+    excl = hc[hc["manager_excluido"].astype(bool)].copy() if "manager_excluido" in hc.columns else pd.DataFrame()
+    valid = hc[(~hc["manager_excluido"].astype(bool)) & hc["periodo_novedad"].ne("")].copy() if "manager_excluido" in hc.columns else hc[hc["periodo_novedad"].ne("")].copy()
+
+    # HC = conteo de posiciones/personas homologadas por periodo. Preferir SAP único; si no hay SAP, contar filas.
+    if "sap" in valid.columns and valid["sap"].ne("").any():
+        hc_group = valid[valid["sap"].ne("")].groupby(KEY_HC, dropna=False)["sap"].nunique().reset_index(name="hc")
+    else:
+        hc_group = valid.groupby(KEY_HC, dropna=False).size().reset_index(name="hc")
+    hc_group = ensure_key_types(hc_group, KEY_HC)
+    hc_group["hc"] = hc_group["hc"].fillna(0).astype(float)
+
+    missing = int(hc["periodo_novedad"].eq("").sum())
+    if missing:
+        alerts.append({"tipo":"Headcount", "mensaje":f"Headcount: {missing:,} registros sin periodo; no entran al conteo HC."})
+    if len(excl):
+        alerts.append({"tipo":"Headcount", "mensaje":f"Headcount: se excluyeron {len(excl):,} registros Manager I-IV/no aplican horas"})
+    sin_cargo = int(valid["cargo_homologado"].isin(["", "Sin homologar", "Sin cargo"]).sum())
+    if sin_cargo:
+        alerts.append({"tipo":"Homologación", "mensaje":f"Headcount: {sin_cargo:,} registros sin cargo homologado después de Posición → Función."})
+    alerts.append({"tipo":"Headcount", "mensaje":f"HC calculado desde posiciones homologadas por periodo: {len(hc_group):,} combinaciones Mes+Área+Cargo."})
+    return hc, hc_group, excl, alerts
 
 
 def add_function_and_cargo(df: pd.DataFrame, source: str, master: Dict[str, Dict[str, str]], func_map: Dict[str, str], hc_full: pd.DataFrame, alerts: List[Dict[str, Any]], prefer_sap: bool = False) -> pd.DataFrame:
@@ -1347,6 +1414,10 @@ def process_all(inputs: Dict[str, List[Any]], umbral: float = 15.0) -> Dict[str,
     progress.progress(35, text="Construyendo Maestro Posición → Función...")
     master, master_audit = build_position_function_master(hc_full, poshom_df)
     alerts.append({"tipo":"Homologación", "mensaje":f"Maestro Posición → Función construido con {len(master):,} llaves únicas"})
+
+    progress.progress(40, text="Calculando HC desde posiciones homologadas por periodo...")
+    hc_full, hc_group, hc_excl, a = finalize_headcount_with_master(hc_full, master, func_map)
+    alerts.extend(a)
 
     progress.progress(45, text="Procesando pagado real CCNómina + compensatorios...")
     pagado_full, pagado_agg, a = process_pagado(inputs.get("ccnomina", []), inputs.get("compensatorios", []), concept_map, func_map, master, hc_full)
